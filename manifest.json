@@ -1,0 +1,32 @@
+{
+    "id": "universal-transcode",
+    "name": "Universal Transcode",
+    "version": "0.1.0",
+    "manifestURI": "",
+    "language": "typescript",
+    "type": "plugin",
+    "description": "Transcodes any Seanime stream (torrent, debrid, local) to H.264/AAC HLS so it plays on any device.",
+    "author": "you",
+    "icon": "",
+    "website": "",
+    "readme": "",
+    "notes": "Needs ffmpeg and Python 3 on the machine running the Seanime server.",
+    "lang": "multi",
+    "payloadURI": "/ABSOLUTE/PATH/TO/universal-transcode/universal-transcode.ts",
+    "plugin": {
+        "version": "1",
+        "permissions": {
+            "scopes": ["system", "playback"],
+            "allow": {
+                "readPaths": ["$TEMP/**/*"],
+                "writePaths": ["$TEMP/**/*"],
+                "commandScopes": [
+                    { "command": "ffmpeg", "args": [{ "validator": "$ARGS" }] },
+                    { "command": "python3", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] },
+                    { "command": "python", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] }
+                ]
+            }
+        }
+    },
+    "isDevelopment": true
+}
