@@ -1,6 +1,43 @@
 {
     "id": "universal-transcode",
     "name": "Universal Transcode",
+    "version": "0.2.0",
+    "manifestURI": "https://raw.githubusercontent.com/shiv121231/UniversalTranscodeSeanime/refs/heads/main/manifest.json",
+    "language": "typescript",
+    "type": "plugin",
+    "description": "Transcodes torrent streams (and any other Seanime stream) to H.264/AAC HLS and serves a web player page that works on any device.",
+    "author": "you",
+    "icon": "",
+    "website": "",
+    "readme": "",
+    "notes": "Needs ffmpeg and Python 3 on the machine running the Seanime server.",
+    "lang": "multi",
+    "payloadURI": "https://raw.githubusercontent.com/shiv121231/UniversalTranscodeSeanime/refs/heads/main/code.ts",
+    "plugin": {
+        "version": "1",
+        "permissions": {
+            "scopes": ["system", "playback"],
+            "allow": {
+                "readPaths": ["$TEMP/**/*"],
+                "writePaths": ["$TEMP/**/*"],
+                "commandScopes": [
+                    { "command": "ps", "args": [{ "value": "-axww" }, { "value": "-o" }, { "value": "etime=,command=" }] },
+
+                    { "command": "ffmpeg", "args": [{ "validator": "$ARGS" }] },
+                    { "command": "/opt/homebrew/bin/ffmpeg", "args": [{ "validator": "$ARGS" }] },
+                    { "command": "/usr/local/bin/ffmpeg", "args": [{ "validator": "$ARGS" }] },
+
+                    { "command": "python3", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] },
+                    { "command": "/usr/bin/python3", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] },
+                    { "command": "/opt/homebrew/bin/python3", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] },
+                    { "command": "/usr/local/bin/python3", "args": [{ "validator": "^.*seanime-transcode.*server\\.py$" }, { "validator": "$ARGS" }] }
+                ]
+            }
+        }
+    }
+}{
+    "id": "universal-transcode",
+    "name": "Universal Transcode",
     "version": "0.1.1",
     "manifestURI": "https://raw.githubusercontent.com/shiv121231/UniversalTranscodeSeanime/refs/heads/main/manifest.json",
     "language": "typescript",
