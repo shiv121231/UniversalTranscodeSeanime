@@ -23,10 +23,11 @@ function init() {
         const pythonRef = ctx.fieldRef<string>("/usr/bin/python3")
         const portRef = ctx.fieldRef<string>("43299")
         const publicRef = ctx.fieldRef<string>("") // e.g. https://hls.example.com  (blank = http://<LAN IP>:<port>)
-        const encRef = ctx.fieldRef<string>("h264_videotoolbox")
+        const encRef = ctx.fieldRef<string>("libx264")
         const heightRef = ctx.fieldRef<string>("1080")
         const audioRef = ctx.fieldRef<string>("0")
-        const burnRef = ctx.fieldRef<boolean>(false)
+        const subRef = ctx.fieldRef<string>("0") // subtitle track number (0 = first); blank = no subtitles
+        const crfRef = ctx.fieldRef<string>("18") // x264 quality: lower = better/larger
 
         let ffmpeg: any = null
         let server: any = null
@@ -97,11 +98,12 @@ wait();
         }
 
         function encoderArgs(enc: string): string[] {
+            const crf = String(parseInt(crfRef.current) || 18)
             switch (enc) {
-                case "h264_nvenc": return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-profile:v", "high", "-level", "4.1"]
-                case "h264_qsv": return ["-c:v", "h264_qsv", "-global_quality", "23", "-profile:v", "high", "-level", "4.1"]
-                case "h264_videotoolbox": return ["-c:v", "h264_videotoolbox", "-b:v", "6M"]
-                default: return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-profile:v", "high", "-level", "4.1"]
+                case "h264_nvenc": return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", crf, "-profile:v", "high", "-level", "4.1"]
+                case "h264_qsv": return ["-c:v", "h264_qsv", "-global_quality", crf, "-profile:v", "high", "-level", "4.1"]
+                case "h264_videotoolbox": return ["-c:v", "h264_videotoolbox", "-b:v", "15M"]
+                default: return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation", "-profile:v", "high", "-level", "4.1"]
             }
         }
 
@@ -169,22 +171,30 @@ wait();
 
             const maxH = parseInt(heightRef.current) || 1080
             const filters = [`scale=-2:'min(ih,${maxH})'`, "format=yuv420p"]
-            if (burnRef.current) filters.unshift(`subtitles=filename='${src}':si=0`)
+
+            // Subtitles are passed through as soft WebVTT tracks inside the HLS output.
+            // (Burning them in would make ffmpeg read the WHOLE file first, which stalls on a partially downloaded torrent.)
+            const subTxt = subRef.current.trim()
+            const wantSubs = subTxt !== "" && !isNaN(parseInt(subTxt))
+            const subIdx = wantSubs ? parseInt(subTxt) : 0
 
             const args = [
                 "-hide_banner", "-loglevel", "warning",
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-i", src,
                 "-map", "0:v:0", "-map", `0:a:${parseInt(audioRef.current) || 0}?`,
-                "-sn",
+                ...(wantSubs ? ["-map", `0:s:${subIdx}?`] : ["-sn"]),
                 "-vf", filters.join(","),
                 ...encoderArgs(encRef.current),
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                ...(wantSubs ? ["-c:s", "webvtt"] : []),
                 "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
                 "-hls_playlist_type", "event",
                 "-hls_flags", "independent_segments",
-                "-hls_segment_filename", $filepath.join(dir, "seg_%05d.ts"),
-                $filepath.join(dir, "index.m3u8"),
+                "-master_pl_name", "index.m3u8",
+                "-var_stream_map", wantSubs ? "v:0,a:0,s:0,sgroup:subs,default:yes" : "v:0,a:0",
+                "-hls_segment_filename", $filepath.join(dir, "v%v_seg_%05d.ts"),
+                $filepath.join(dir, "v%v.m3u8"),
             ]
 
             try {
@@ -217,7 +227,7 @@ wait();
             if (readyTimer) readyTimer()
             readyTimer = ctx.setInterval(() => {
                 try {
-                    $os.stat($filepath.join(dir, "seg_00001.ts"))
+                    $os.stat($filepath.join(dir, "v0_seg_00001.ts"))
                     status.set("Ready – open the link below on any device")
                     if (readyTimer) readyTimer()
                 } catch (e) { }
@@ -245,8 +255,8 @@ wait();
                     tray.select({
                         label: "Encoder", fieldRef: encRef,
                         options: [
-                            { label: "Apple (videotoolbox)", value: "h264_videotoolbox" },
-                            { label: "CPU (libx264)", value: "libx264" },
+                            { label: "CPU (libx264) – best quality", value: "libx264" },
+                            { label: "Apple (videotoolbox) – fast, lower quality", value: "h264_videotoolbox" },
                             { label: "NVIDIA (nvenc)", value: "h264_nvenc" },
                             { label: "Intel (qsv)", value: "h264_qsv" },
                         ],
@@ -256,7 +266,8 @@ wait();
                         options: [{ label: "1080p", value: "1080" }, { label: "720p", value: "720" }, { label: "480p", value: "480" }],
                     }),
                     tray.input({ label: "Audio track index", fieldRef: audioRef }),
-                    tray.checkbox({ label: "Burn in subtitles (first track)", fieldRef: burnRef }),
+                    tray.input({ label: "Subtitle track number (0 = first, blank = none)", fieldRef: subRef }),
+                    tray.input({ label: "Quality CRF (lower = better, 18 default)", fieldRef: crfRef }),
                     tray.input({ label: "ffmpeg path", fieldRef: ffmpegRef }),
                     tray.input({ label: "python3 path", fieldRef: pythonRef }),
                     tray.input({ label: "Output port", fieldRef: portRef }),
