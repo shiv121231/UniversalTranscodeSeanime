@@ -15,6 +15,7 @@ function init() {
         // ---------- state ----------
         const status = ctx.state<string>("Idle")
         const outUrl = ctx.state<string>("")
+        const debug = ctx.state<string>("")
 
         const srcRef = ctx.fieldRef<string>("")
         const baseRef = ctx.fieldRef<string>("http://127.0.0.1:43211")
@@ -35,16 +36,16 @@ function init() {
         // ---------- helpers ----------
         const log = (m: string) => console.log("[universal-transcode] " + m)
 
-        // Recursively look for something that looks like a stream URL in the playback info.
-        // (I could not confirm the exact field name, so this is deliberately defensive.)
-        function findUrl(o: any, depth = 0): string {
-            if (!o || depth > 4) return ""
-            if (typeof o === "string") return /^(https?:\/\/|\/api\/)/.test(o) && /stream|\.m3u8|\.mkv|\.mp4/i.test(o) ? o : ""
-            if (typeof o === "object") {
-                for (const k of Object.keys(o)) {
-                    const r = findUrl(o[k], depth + 1)
-                    if (r) return r
-                }
+        // Playback info may be a Go-bound object where Object.keys() finds nothing,
+        // so serialise it and regex out anything that looks like a stream URL.
+        function findUrl(o: any): string {
+            let json = ""
+            try { json = JSON.stringify(o) || "" } catch (e) { return "" }
+            const re = /"((?:https?:\/\/|\/api\/)[^"]+)"/g
+            let m: RegExpExecArray | null
+            while ((m = re.exec(json))) {
+                const u = m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/")
+                if (/stream|\.m3u8|\.mkv|\.mp4/i.test(u)) return u
             }
             return ""
         }
@@ -175,9 +176,18 @@ http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
             try {
                 const info = (ctx.videoCore as any).getCurrentPlaybackInfo()
                 const u = findUrl(info)
-                if (u) { srcRef.setValue(absolute(u)); ctx.toast.success("Grabbed current stream") }
-                else ctx.toast.warning("No stream URL found in playback info – paste it manually")
+                if (u) {
+                    srcRef.setValue(absolute(u)); debug.set("")
+                    ctx.toast.success("Grabbed current stream")
+                } else {
+                    // Show what we got so the right field can be identified
+                    let raw = ""
+                    try { raw = JSON.stringify(info) } catch (e) { raw = String(info) }
+                    debug.set((raw || "(empty)").slice(0, 1200))
+                    ctx.toast.warning("No stream URL found – see the debug text in the panel")
+                }
             } catch (e) {
+                debug.set("getCurrentPlaybackInfo threw: " + e)
                 ctx.toast.error("Nothing is playing in the built-in player")
             }
         }
@@ -219,6 +229,7 @@ http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
                     }),
                     tray.text(status.get()),
                     tray.text(outUrl.get() || "", { style: { wordBreak: "break-all", userSelect: "text" } }),
+                    ...(debug.get() ? [tray.text(debug.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
                 ],
             }),
         )
