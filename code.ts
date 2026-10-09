@@ -13,6 +13,7 @@ function init() {
 
         const status = ctx.state<string>("Server stopped")
         const link = ctx.state<string>("")
+        const watch = ctx.state<string>("")
         const note = ctx.state<string>("")
 
         // Persisted settings. The access key is kept in plugin storage AND in a file, so it survives reloads.
@@ -35,6 +36,7 @@ function init() {
         const crfRef = ctx.fieldRef<string>(saved("crf", "18"))
         const subRef = ctx.fieldRef<string>(saved("sub", "0")) // blank = no subtitles
         const audioRef = ctx.fieldRef<string>(saved("audio", "0"))
+        const iinaRef = ctx.fieldRef<string>(saved("iina", "")) // blank = bridge off; e.g. /tmp/iina_socket
 
         let server: any = null
         const root = $filepath.join($os.tempDir(), "seanime-transcode")
@@ -63,10 +65,13 @@ ap.add_argument("--crf", default="18")
 ap.add_argument("--height", default="1080")
 ap.add_argument("--audio", default="0")
 ap.add_argument("--sub", default="0")  # "" = no subtitles
+ap.add_argument("--iina-socket", default="", help="bridge mode: IINA/mpv IPC socket, e.g. /tmp/iina_socket")
+ap.add_argument("--keep-iina-audio", action="store_true", help="bridge mode: do not mute IINA")
 A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
+VERSION = "0.5.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -100,6 +105,12 @@ function wait() {
     });
 }
 wait();
+// Bridge mode: report position/pause state so IINA (and so Seanime's progress tracking) follows this player.
+var qk = new URLSearchParams(location.search).get('key'), sid = location.pathname.split('/')[1];
+if (qk) setInterval(function () {
+  if (!v.currentTime && v.paused) return;
+  fetch('/sync?key=' + encodeURIComponent(qk) + '&sid=' + sid + '&t=' + v.currentTime.toFixed(1) + '&p=' + (v.paused ? 1 : 0)).catch(function () {});
+}, 5000);
 </script>
 """
 
@@ -203,6 +214,68 @@ def describe(raw):
     return "received (query removed): %s" % ((u.scheme + "://" if u.scheme else "") + u.netloc + u.path)[:200]
 
 
+
+# ---------------------------------------------------------------- IINA / mpv bridge
+bridge = {"path": None, "sid": None, "gone_since": None}
+
+
+def ipc(cmd, timeout=2.0):
+    """One-shot mpv JSON IPC request. Returns the parsed reply or None."""
+    try:
+        sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sk.settimeout(timeout)
+        sk.connect(A.iina_socket)
+        sk.sendall((json.dumps({"command": cmd, "request_id": 4242}) + "\\n").encode())
+        buf, end = b"", time.time() + timeout
+        while time.time() < end:
+            chunk = sk.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            for line in buf.split(b"\\n"):
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                if j.get("request_id") == 4242:
+                    sk.close()
+                    return j
+        sk.close()
+    except Exception:
+        pass
+    return None
+
+
+def ipc_get(prop):
+    r = ipc(["get_property", prop])
+    return r.get("data") if r and r.get("error") == "success" else None
+
+
+def bridge_loop():
+    """Watch IINA: when it opens a Seanime stream, transcode it; when it goes away, stop."""
+    while True:
+        try:
+            path = ipc_get("path")
+            if isinstance(path, str) and local_stream_url(path):
+                bridge["gone_since"] = None
+                if path != bridge["path"]:
+                    bridge["path"] = path
+                    bridge["sid"] = start_transcode(local_stream_url(path), {
+                        "sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf, "enc": A.encoder})
+                    if not A.keep_iina_audio:
+                        ipc(["set_property", "mute", True])  # you watch in the browser, not on the Mac
+            else:
+                if bridge["gone_since"] is None:
+                    bridge["gone_since"] = time.time()
+                elif bridge["path"] and time.time() - bridge["gone_since"] > 30:
+                    with lock:
+                        stop_current()
+                    bridge.update(path=None, sid=None)
+        except Exception as e:
+            sys.stderr.write("bridge: %s\\n" % e)
+        time.sleep(2)
+
+
 class H(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
                       ".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t", ".vtt": "text/vtt"}
@@ -234,8 +307,34 @@ class H(http.server.SimpleHTTPRequestHandler):
         if path == "/status":
             # deliberately minimal: no session id and no log (the log can contain the stream token)
             p = current["proc"]
-            return self.reply(200, json.dumps({"exited": bool(p and p.poll() is not None),
+            return self.reply(200, json.dumps({"version": VERSION, "exited": bool(p and p.poll() is not None),
                                                "code": p.poll() if p else None}), "application/json")
+        if path == "/watch" and A.iina_socket:
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            if not hmac.compare_digest(q.get("key", [""])[0], A.key):
+                return self.reply(403, "bad key")
+            sid = current["id"]
+            if sid:
+                self.send_response(302)
+                self.send_header("Location", "/%s/player.html?key=%s" % (sid, urllib.parse.quote(A.key)))
+                return self.end_headers()
+            return self.reply(200, "<meta http-equiv='refresh' content='3'><body style='background:#000;color:#ccc;"
+                                   "font-family:sans-serif'><p style='padding:12px'>Waiting for IINA to start a Seanime "
+                                   "stream... (this page refreshes by itself)</p>", "text/html")
+        if path == "/sync" and A.iina_socket:
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            if not hmac.compare_digest(q.get("key", [""])[0], A.key) or q.get("sid", [""])[0] != current["id"]:
+                return self.reply(403, "no")
+            try:
+                t, paused = float(q.get("t", ["0"])[0]), q.get("p", ["0"])[0] == "1"
+            except ValueError:
+                return self.reply(400, "bad args")
+            pos = ipc_get("time-pos")
+            if isinstance(pos, (int, float)) and abs(pos - t) > 5:
+                ipc(["seek", t, "absolute"])
+            if ipc_get("pause") != paused:
+                ipc(["set_property", "pause", paused])
+            return self.reply(200, "ok")
         if path == "/shutdown":
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             if not hmac.compare_digest(q.get("token", [""])[0], SHUTDOWN_TOKEN):
@@ -244,7 +343,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             threading.Thread(target=lambda: (time.sleep(0.3), stop_current(), os._exit(0)), daemon=True).start()
             return
         if path == "/":
-            return self.reply(200, "Universal Transcode is running. Use /play?key=KEY&src=STREAM_URL")
+            return self.reply(200, "Universal Transcode %s is running. Use /play?key=KEY&src=STREAM_URL" % VERSION)
         return super().do_GET()
 
     def play(self):
@@ -298,6 +397,9 @@ try:
 except Exception:
     pass
 
+if A.iina_socket:
+    threading.Thread(target=bridge_loop, daemon=True).start()
+
 httpd = None
 for _ in range(10):
     try:
@@ -317,7 +419,7 @@ except KeyboardInterrupt:
             const f: Record<string, string> = {
                 python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
                 seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
-                sub: subRef.current, audio: audioRef.current,
+                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
             try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
@@ -347,6 +449,7 @@ except KeyboardInterrupt:
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
                     "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                    ...(iinaRef.current.trim() ? ["--iina-socket", iinaRef.current.trim()] : []),
                 )
             } catch (e) {
                 ctx.toast.error("Could not start the server (check the Python path): " + e)
@@ -359,17 +462,20 @@ except KeyboardInterrupt:
             })
 
             // Work out the public base (public URL, else LAN IP written by the server)
-            let base = publicRef.current.trim().replace(/\/$/, "")
+            const setLinks = (b: string) => {
+                link.set(`${b}/play?key=${keyRef.current.trim()}&src={url}`)
+                watch.set(iinaRef.current.trim() ? `${b}/watch?key=${keyRef.current.trim()}` : "")
+            }
+            const base = publicRef.current.trim().replace(/\/$/, "")
             if (!base) {
-                let host = ""
+                setLinks(`http://localhost:${portRef.current.trim()}`)
                 ctx.setTimeout(() => {
+                    let host = ""
                     try { host = $toString($os.readFile($filepath.join(root, "ip.txt"))).trim() } catch (e) { }
-                    const b = `http://${host || "localhost"}:${portRef.current.trim()}`
-                    link.set(`${b}/play?key=${keyRef.current.trim()}&src={url}`)
+                    setLinks(`http://${host || "localhost"}:${portRef.current.trim()}`)
                 }, 1500)
-                link.set(`http://localhost:${portRef.current.trim()}/play?key=${keyRef.current.trim()}&src={url}`)
             } else {
-                link.set(`${base}/play?key=${keyRef.current.trim()}&src={url}`)
+                setLinks(base)
             }
             status.set("Server running")
             ctx.toast.success("Transcode server started")
@@ -384,6 +490,10 @@ except KeyboardInterrupt:
                     tray.text("Universal Transcode", { style: { fontWeight: "bold" } }),
                     tray.text("Paste this into Seanime -> Settings -> External player link:"),
                     tray.text(link.get() || "(press Start server)", { style: { wordBreak: "break-all", userSelect: "text", fontSize: "11px" } }),
+                    ...(watch.get() ? [
+                        tray.text("Bridge mode: bookmark this page. It always shows what IINA is playing:"),
+                        tray.text(watch.get(), { style: { wordBreak: "break-all", userSelect: "text", fontSize: "11px" } }),
+                    ] : []),
                     tray.flex({ items: [
                         tray.button({ label: "Start / apply settings", onClick: onStart, intent: "primary" }),
                         tray.button({ label: "Stop", onClick: onStop, intent: "alert-subtle" }),
@@ -404,6 +514,7 @@ except KeyboardInterrupt:
                     tray.input({ label: "ffmpeg path", fieldRef: ffmpegRef }),
                     tray.input({ label: "python3 path", fieldRef: pythonRef }),
                     tray.input({ label: "Seanime server URL (local)", fieldRef: seanimeRef }),
+                    tray.input({ label: "IINA bridge socket (blank = off, usually /tmp/iina_socket)", fieldRef: iinaRef }),
                     tray.input({ label: "Access key (part of the link; changing it means re-pasting the link in Seanime)", fieldRef: keyRef }),
                     ...(note.get() ? [tray.text(note.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
                 ],
