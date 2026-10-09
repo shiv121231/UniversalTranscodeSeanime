@@ -3,286 +3,328 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v0.2
-// 1. Seanime launches your external player (IINA/mpv/VLC) with a torrent stream URL.
-//    "Grab from running player" reads that URL from the process list (macOS/Linux).
-// 2. ffmpeg converts it to H.264/AAC HLS.
-// 3. A tiny file server hosts the HLS plus a player page (hls.js) you can open on any device.
+// Universal Transcode v0.4
+// Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
+// link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
 
 function init() {
     $ui.register((ctx) => {
         const tray = ctx.newTray({ tooltipText: "Universal Transcode", iconUrl: "", withContent: true })
 
-        // ---------- state ----------
-        const status = ctx.state<string>("Idle")
-        const outUrl = ctx.state<string>("")
-        const debug = ctx.state<string>("")
+        const status = ctx.state<string>("Server stopped")
+        const link = ctx.state<string>("")
+        const note = ctx.state<string>("")
 
-        const srcRef = ctx.fieldRef<string>("")
-        const ffmpegRef = ctx.fieldRef<string>("/opt/homebrew/bin/ffmpeg")
-        const pythonRef = ctx.fieldRef<string>("/usr/bin/python3")
-        const portRef = ctx.fieldRef<string>("43299")
-        const publicRef = ctx.fieldRef<string>("") // e.g. https://hls.example.com  (blank = http://<LAN IP>:<port>)
-        const encRef = ctx.fieldRef<string>("libx264")
-        const heightRef = ctx.fieldRef<string>("1080")
-        const audioRef = ctx.fieldRef<string>("0")
-        const subRef = ctx.fieldRef<string>("0") // subtitle track number (0 = first); blank = no subtitles
-        const crfRef = ctx.fieldRef<string>("18") // x264 quality: lower = better/larger
+        // Persisted settings (the key is generated once and kept)
+        const saved = (k: string, d: string) => { try { return $storage.get<string>("ut." + k) ?? d } catch (e) { return d } }
+        let key = saved("key", "")
+        if (!key) {
+            for (let i = 0; i < 24; i++) key += Math.floor(Math.random() * 16).toString(16)
+            try { $storage.set("ut.key", key) } catch (e) { }
+        }
 
-        let ffmpeg: any = null
+        const pythonRef = ctx.fieldRef<string>(saved("python", "/usr/bin/python3"))
+        const ffmpegRef = ctx.fieldRef<string>(saved("ffmpeg", "/opt/homebrew/bin/ffmpeg"))
+        const portRef = ctx.fieldRef<string>(saved("port", "43299"))
+        const publicRef = ctx.fieldRef<string>(saved("public", "")) // e.g. https://hls.example.com
+        const seanimeRef = ctx.fieldRef<string>(saved("seanime", "http://127.0.0.1:43211"))
+        const encRef = ctx.fieldRef<string>(saved("enc", "libx264"))
+        const heightRef = ctx.fieldRef<string>(saved("height", "1080"))
+        const crfRef = ctx.fieldRef<string>(saved("crf", "18"))
+        const subRef = ctx.fieldRef<string>(saved("sub", "0")) // blank = no subtitles
+        const audioRef = ctx.fieldRef<string>(saved("audio", "0"))
+
         let server: any = null
-        let readyTimer: any = null
-
         const root = $filepath.join($os.tempDir(), "seanime-transcode")
         const log = (m: string) => console.log("[universal-transcode] " + m)
 
-        // ---------- static files ----------
-        const SERVER_PY = `
-import http.server, os, socket, sys
-root, port = sys.argv[1], int(sys.argv[2])
-os.chdir(root)
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1))
-    open(os.path.join(root, "ip.txt"), "w").write(s.getsockname()[0]); s.close()
-except Exception:
-    pass
+        const SERVER_PY = `#!/usr/bin/env python3
+"""Universal Transcode server.
+
+Seanime's "External player link" setting opens a URL of your choice with the stream URL filled in.
+Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server will:
+  1. take the stream URL (the path + token), swap the host for the local Seanime server,
+  2. run ffmpeg to produce H.264/AAC HLS with soft WebVTT subtitles,
+  3. redirect the browser to a small hls.js player page.
+It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
+"""
+import argparse, atexit, hmac, http.server, json, os, secrets, shutil, socket, subprocess, sys, threading, urllib.parse
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--root", required=True)
+ap.add_argument("--port", type=int, default=43299)
+ap.add_argument("--seanime", default="http://127.0.0.1:43211")
+ap.add_argument("--ffmpeg", default="ffmpeg")
+ap.add_argument("--key", default="")
+ap.add_argument("--encoder", default="libx264")
+ap.add_argument("--crf", default="18")
+ap.add_argument("--height", default="1080")
+ap.add_argument("--audio", default="0")
+ap.add_argument("--sub", default="0")  # "" = no subtitles
+A = ap.parse_args()
+
+os.makedirs(A.root, exist_ok=True)
+os.chdir(A.root)
+LOCAL = A.seanime.rstrip("/")
+lock = threading.Lock()
+current = {"proc": None, "dir": None, "id": None}
+
+PLAYER = """<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Universal Transcode</title>
+<body style="margin:0;background:#000;color:#ccc;font-family:sans-serif">
+<video id="v" controls autoplay playsinline style="width:100vw;height:100vh"></video>
+<div id="m" style="position:fixed;top:12px;left:12px;font-size:14px">Starting transcode...</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5/dist/hls.min.js"></script>
+<script>
+var v = document.getElementById('v'), m = document.getElementById('m'), src = 'index.m3u8';
+function begin() {
+  m.style.display = 'none';
+  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = src; return; }
+  if (window.Hls && Hls.isSupported()) { var h = new Hls(); h.loadSource(src); h.attachMedia(v); }
+  else m.style.display = 'block', m.textContent = 'This browser cannot play HLS.';
+}
+function wait() {
+  fetch(src).then(function (r) { if (!r.ok) throw 0; begin(); })
+    .catch(function () {
+      fetch('/status').then(function (r) { return r.json(); }).then(function (s) {
+        if (s.exited && s.code !== 0) { m.textContent = 'ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.'; return; }
+        setTimeout(wait, 1500);
+      }).catch(function () { setTimeout(wait, 1500); });
+    });
+}
+wait();
+</script>
+"""
+
+
+def encoder_args(enc, crf):
+    if enc == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", crf, "-profile:v", "high", "-level", "4.1"]
+    if enc == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-global_quality", crf, "-profile:v", "high", "-level", "4.1"]
+    if enc == "h264_videotoolbox":
+        return ["-c:v", "h264_videotoolbox", "-b:v", "15M"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation",
+            "-profile:v", "high", "-level", "4.1"]
+
+
+def stop_current():
+    p = current["proc"]
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+    if current["dir"]:
+        shutil.rmtree(current["dir"], ignore_errors=True)
+    current.update(proc=None, dir=None, id=None)
+
+
+def start_transcode(src, o):
+    with lock:
+        stop_current()
+        sid = secrets.token_hex(8)
+        d = os.path.join(A.root, sid)
+        os.makedirs(d)
+        with open(os.path.join(d, "player.html"), "w") as f:
+            f.write(PLAYER)
+        sub = o["sub"].strip()
+        want_subs = sub.lstrip("-").isdigit() and int(sub) >= 0
+        height = int(o["height"]) if o["height"].isdigit() else 1080
+        audio = int(o["audio"]) if o["audio"].isdigit() else 0
+        crf = o["crf"] if o["crf"].isdigit() else "18"
+        cmd = [A.ffmpeg, "-hide_banner", "-loglevel", "warning",
+               "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+               "-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio]
+        cmd += ["-map", "0:s:%d?" % int(sub)] if want_subs else ["-sn"]
+        cmd += ["-vf", "scale=-2:'min(ih,%d)',format=yuv420p" % height]
+        cmd += encoder_args(o["enc"], crf)
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        if want_subs:
+            cmd += ["-c:s", "webvtt"]
+        cmd += ["-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
+                "-hls_flags", "independent_segments", "-master_pl_name", "index.m3u8",
+                "-var_stream_map", "v:0,a:0,s:0,sgroup:subs,default:yes" if want_subs else "v:0,a:0",
+                "-hls_segment_filename", os.path.join(d, "v%v_seg_%05d.ts"), os.path.join(d, "v%v.m3u8")]
+        log = open(os.path.join(d, "ffmpeg.log"), "wb")
+        current.update(proc=subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log), dir=d, id=sid)
+        return sid
+
+
+def local_stream_url(raw):
+    """Turn whatever Seanime handed us into a URL on the local Seanime server (path + token kept)."""
+    if raw.lower().startswith(("http%3a", "https%3a")):
+        raw = urllib.parse.unquote(raw)
+    u = urllib.parse.urlsplit(raw)
+    if not u.path.startswith("/api/v1/") or "stream" not in u.path:
+        return None
+    return LOCAL + u.path + ("?" + u.query if u.query else "")
+
+
 class H(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
-        ".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t", ".vtt": "text/vtt"}
+                      ".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t", ".vtt": "text/vtt"}
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
-    def log_message(self, *a): pass
-http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+
+    def log_message(self, *a):
+        pass
+
+    def list_directory(self, path):
+        self.send_error(404)
+        return None
+
+    def reply(self, code, body, ctype="text/plain"):
+        b = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/play":
+            return self.play()
+        if path == "/status":
+            # deliberately minimal: no session id and no log (the log can contain the stream token)
+            p = current["proc"]
+            return self.reply(200, json.dumps({"exited": bool(p and p.poll() is not None),
+                                               "code": p.poll() if p else None}), "application/json")
+        if path == "/":
+            return self.reply(200, "Universal Transcode is running. Use /play?key=KEY&src=STREAM_URL")
+        return super().do_GET()
+
+    def play(self):
+        q = self.path.split("?", 1)[1] if "?" in self.path else ""
+        i = q.find("src=")
+        if i < 0:
+            return self.reply(400, "missing src")
+        # src must come last: it may contain its own ?token=... which would otherwise be split off
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(q[:i]).items()}
+        if A.key and not hmac.compare_digest(params.get("key", ""), A.key):
+            return self.reply(403, "bad key")
+        src = local_stream_url(q[i + 4:])
+        if not src:
+            return self.reply(400, "src is not a Seanime stream URL")
+        o = {"sub": params.get("sub", A.sub), "audio": params.get("audio", A.audio),
+             "height": params.get("h", A.height), "crf": params.get("crf", A.crf),
+             "enc": params.get("enc", A.encoder)}
+        sid = start_transcode(src, o)
+        self.send_response(302)
+        self.send_header("Location", "/%s/player.html" % sid)
+        self.end_headers()
+
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("10.255.255.255", 1))
+    open(os.path.join(A.root, "ip.txt"), "w").write(s.getsockname()[0])
+    s.close()
+except Exception:
+    pass
+
+atexit.register(lambda: stop_current())
+try:
+    http.server.ThreadingHTTPServer(("0.0.0.0", A.port), H).serve_forever()
+except KeyboardInterrupt:
+    pass
 `
 
-        // Player page served next to the playlist. Waits until ffmpeg has produced the playlist.
-        const PLAYER_HTML = `<!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Universal Transcode</title>
-<body style="margin:0;background:#000">
-<video id="v" controls autoplay playsinline style="width:100vw;height:100vh"></video>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5/dist/hls.min.js"></script>
-<script>
-var v = document.getElementById('v'), src = 'index.m3u8';
-function begin() {
-  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = src; return; }
-  if (window.Hls && Hls.isSupported()) { var h = new Hls(); h.loadSource(src); h.attachMedia(v); }
-  else document.body.innerText = 'This browser cannot play HLS.';
-}
-function wait() {
-  fetch(src).then(function (r) { if (!r.ok) throw 0; begin(); })
-            .catch(function () { setTimeout(wait, 1500); });
-}
-wait();
-</script>
-`
-
-        // ---------- helpers ----------
-        function kill(p: any) {
-            if (!p) return
-            try { p.getCommand().process.kill() } catch (e) { log("kill failed: " + e) }
-        }
-
-        function ensureServer() {
-            if (server) return
-            $os.mkdirAll(root, 0o755)
-            const script = $filepath.join(root, "server.py")
-            $os.writeFile(script, $toBytes(SERVER_PY), 0o644)
-            server = $osExtra.asyncCmd(pythonRef.current.trim() || "python3", script, root, portRef.current)
-            server.run((data: any, err: any, code: any) => {
-                if (err) log("server: " + $toString(err))
-                if (code !== undefined) { log("server exited " + code); server = null }
-            })
-        }
-
-        function encoderArgs(enc: string): string[] {
-            const crf = String(parseInt(crfRef.current) || 18)
-            switch (enc) {
-                case "h264_nvenc": return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", crf, "-profile:v", "high", "-level", "4.1"]
-                case "h264_qsv": return ["-c:v", "h264_qsv", "-global_quality", crf, "-profile:v", "high", "-level", "4.1"]
-                case "h264_videotoolbox": return ["-c:v", "h264_videotoolbox", "-b:v", "15M"]
-                default: return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation", "-profile:v", "high", "-level", "4.1"]
+        function persist() {
+            const f: Record<string, string> = {
+                python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
+                seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
+                sub: subRef.current, audio: audioRef.current,
             }
-        }
-
-        function randomId(): string {
-            let s = ""
-            for (let i = 0; i < 16; i++) s += Math.floor(Math.random() * 16).toString(16)
-            return s
-        }
-
-        // ---------- grab the stream URL from the running external player ----------
-        // Seanime starts the player as: <player> ... http://127.0.0.1:43211/api/v1/torrentstream/stream/<file>?token=...
-        // `ps` lists every process; we keep the matching one that started most recently.
-        function grabFromPlayer() {
-            const chunks: string[] = []
-            let cmd: any
-            try {
-                cmd = $osExtra.asyncCmd("ps", "-axww", "-o", "etime=,command=")
-            } catch (e) {
-                ctx.toast.error("Could not run ps (macOS/Linux only): " + e)
-                return
-            }
-            cmd.run((data: any, err: any, code: any) => {
-                if (data) chunks.push($toString(data))
-                if (code === undefined) return
-
-                const urlRe = /(https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]|\d+\.\d+\.\d+\.\d+)(?::\d+)?\/api\/v1\/\S*stream\S*)/
-                const etimeRe = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$/
-                let best = "", bestAge = Infinity
-                for (const line of chunks.join("\n").split("\n")) {
-                    const m = etimeRe.exec(line)
-                    if (!m) continue
-                    const u = urlRe.exec(m[5])
-                    if (!u) continue
-                    // elapsed seconds since the process started: smaller = newer
-                    const age = (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+m[3]) * 60 + (+m[4])
-                    if (age < bestAge) { bestAge = age; best = u[1] }
-                }
-
-                if (best) {
-                    srcRef.setValue(best)
-                    debug.set("")
-                    ctx.toast.success("Grabbed stream from the running player")
-                } else {
-                    debug.set("No player process with a Seanime stream URL found. Start the episode in your external player first, then press Grab again.")
-                    ctx.toast.warning("No running player stream found")
-                }
-            })
-        }
-
-        // ---------- start / stop ----------
-        function start() {
-            const src = srcRef.current.trim()
-            if (!src) { ctx.toast.warning("Press Grab (or paste a source URL) first"); return }
-            stop()
-
-            try { ensureServer() } catch (e) {
-                ctx.toast.error("Could not start file server (check the Python path): " + e)
-                return
-            }
-
-            const id = randomId()
-            const dir = $filepath.join(root, id)
-            $os.mkdirAll(dir, 0o755)
-            $os.writeFile($filepath.join(dir, "player.html"), $toBytes(PLAYER_HTML), 0o644)
-
-            const maxH = parseInt(heightRef.current) || 1080
-            const filters = [`scale=-2:'min(ih,${maxH})'`, "format=yuv420p"]
-
-            // Subtitles are passed through as soft WebVTT tracks inside the HLS output.
-            // (Burning them in would make ffmpeg read the WHOLE file first, which stalls on a partially downloaded torrent.)
-            const subTxt = subRef.current.trim()
-            const wantSubs = subTxt !== "" && !isNaN(parseInt(subTxt))
-            const subIdx = wantSubs ? parseInt(subTxt) : 0
-
-            const args = [
-                "-hide_banner", "-loglevel", "warning",
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-i", src,
-                "-map", "0:v:0", "-map", `0:a:${parseInt(audioRef.current) || 0}?`,
-                ...(wantSubs ? ["-map", `0:s:${subIdx}?`] : ["-sn"]),
-                "-vf", filters.join(","),
-                ...encoderArgs(encRef.current),
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-                ...(wantSubs ? ["-c:s", "webvtt"] : []),
-                "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
-                "-hls_playlist_type", "event",
-                "-hls_flags", "independent_segments",
-                "-master_pl_name", "index.m3u8",
-                "-var_stream_map", wantSubs ? "v:0,a:0,s:0,sgroup:subs,default:yes" : "v:0,a:0",
-                "-hls_segment_filename", $filepath.join(dir, "v%v_seg_%05d.ts"),
-                $filepath.join(dir, "v%v.m3u8"),
-            ]
-
-            try {
-                ffmpeg = $osExtra.asyncCmd(ffmpegRef.current.trim() || "ffmpeg", ...args)
-            } catch (e) {
-                ctx.toast.error("Could not run ffmpeg (check the ffmpeg path): " + e)
-                return
-            }
-            ffmpeg.run((data: any, err: any, code: any) => {
-                if (err) {
-                    const t = $toString(err)
-                    log("ffmpeg: " + t)
-                    debug.set(t.slice(-600))
-                }
-                if (code !== undefined) {
-                    status.set(code === 0 ? "Finished" : `ffmpeg exited (${code}) – see the log text below`)
-                    ffmpeg = null
-                }
-            })
-
-            let base = publicRef.current.trim().replace(/\/$/, "")
-            if (!base) {
-                let host = ""
-                try { host = $toString($os.readFile($filepath.join(root, "ip.txt"))).trim() } catch (e) { }
-                base = `http://${host || "localhost"}:${portRef.current}`
-            }
-            outUrl.set(`${base}/${id}/player.html`)
-            status.set("Transcoding… (playable after a few seconds)")
-
-            if (readyTimer) readyTimer()
-            readyTimer = ctx.setInterval(() => {
-                try {
-                    $os.stat($filepath.join(dir, "v0_seg_00001.ts"))
-                    status.set("Ready – open the link below on any device")
-                    if (readyTimer) readyTimer()
-                } catch (e) { }
-            }, 1000)
+            for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
         }
 
         function stop() {
-            if (readyTimer) { readyTimer(); readyTimer = null }
-            kill(ffmpeg); ffmpeg = null
-            status.set("Idle")
+            if (server) { try { server.getCommand().process.kill() } catch (e) { log("kill failed: " + e) } server = null }
         }
 
-        // ---------- UI ----------
-        const onGrab = ctx.eventHandler("ut-grab", grabFromPlayer)
+        function start() {
+            persist()
+            stop()
+            try {
+                $os.mkdirAll(root, 0o755)
+                const script = $filepath.join(root, "server.py")
+                $os.writeFile(script, $toBytes(SERVER_PY), 0o644)
+                server = $osExtra.asyncCmd(
+                    pythonRef.current.trim() || "python3", script,
+                    "--root", root, "--port", portRef.current.trim(),
+                    "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
+                    "--key", key, "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
+                    "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                )
+            } catch (e) {
+                ctx.toast.error("Could not start the server (check the Python path): " + e)
+                status.set("Failed to start")
+                return
+            }
+            server.run((data: any, err: any, code: any) => {
+                if (err) { log("server: " + $toString(err)); note.set($toString(err).slice(-400)) }
+                if (code !== undefined) { status.set("Server stopped (" + code + ")"); server = null }
+            })
+
+            // Work out the public base (public URL, else LAN IP written by the server)
+            let base = publicRef.current.trim().replace(/\/$/, "")
+            if (!base) {
+                let host = ""
+                ctx.setTimeout(() => {
+                    try { host = $toString($os.readFile($filepath.join(root, "ip.txt"))).trim() } catch (e) { }
+                    const b = `http://${host || "localhost"}:${portRef.current.trim()}`
+                    link.set(`${b}/play?key=${key}&src={url}`)
+                }, 1500)
+                link.set(`http://localhost:${portRef.current.trim()}/play?key=${key}&src={url}`)
+            } else {
+                link.set(`${base}/play?key=${key}&src={url}`)
+            }
+            status.set("Server running")
+            ctx.toast.success("Transcode server started")
+        }
+
         const onStart = ctx.eventHandler("ut-start", start)
-        const onStop = ctx.eventHandler("ut-stop", stop)
+        const onStop = ctx.eventHandler("ut-stop", () => { stop(); status.set("Server stopped") })
 
         tray.render(() =>
             tray.stack({
                 items: [
                     tray.text("Universal Transcode", { style: { fontWeight: "bold" } }),
-                    tray.text("1) Start the episode in your external player  2) Grab  3) Start"),
-                    tray.button({ label: "Grab from running player", onClick: onGrab, intent: "gray-subtle", size: "sm" }),
-                    tray.input({ label: "Source URL", fieldRef: srcRef }),
-                    tray.select({
-                        label: "Encoder", fieldRef: encRef,
-                        options: [
-                            { label: "CPU (libx264) – best quality", value: "libx264" },
-                            { label: "Apple (videotoolbox) – fast, lower quality", value: "h264_videotoolbox" },
-                            { label: "NVIDIA (nvenc)", value: "h264_nvenc" },
-                            { label: "Intel (qsv)", value: "h264_qsv" },
-                        ],
-                    }),
-                    tray.select({
-                        label: "Max height", fieldRef: heightRef,
-                        options: [{ label: "1080p", value: "1080" }, { label: "720p", value: "720" }, { label: "480p", value: "480" }],
-                    }),
-                    tray.input({ label: "Audio track index", fieldRef: audioRef }),
-                    tray.input({ label: "Subtitle track number (0 = first, blank = none)", fieldRef: subRef }),
-                    tray.input({ label: "Quality CRF (lower = better, 18 default)", fieldRef: crfRef }),
+                    tray.text("Paste this into Seanime -> Settings -> External player link:"),
+                    tray.text(link.get() || "(press Start server)", { style: { wordBreak: "break-all", userSelect: "text", fontSize: "11px" } }),
+                    tray.flex({ items: [
+                        tray.button({ label: "Start / apply settings", onClick: onStart, intent: "primary" }),
+                        tray.button({ label: "Stop", onClick: onStop, intent: "alert-subtle" }),
+                    ] }),
+                    tray.text(status.get()),
+                    tray.input({ label: "Subtitle track (0 = first, blank = none)", fieldRef: subRef }),
+                    tray.input({ label: "Audio track (0 = first)", fieldRef: audioRef }),
+                    tray.input({ label: "Quality CRF (lower = better, 18)", fieldRef: crfRef }),
+                    tray.select({ label: "Max height", fieldRef: heightRef, options: [
+                        { label: "1080p", value: "1080" }, { label: "720p", value: "720" }, { label: "480p", value: "480" } ] }),
+                    tray.select({ label: "Encoder", fieldRef: encRef, options: [
+                        { label: "CPU (libx264) - best quality", value: "libx264" },
+                        { label: "Apple (videotoolbox) - fast", value: "h264_videotoolbox" },
+                        { label: "NVIDIA (nvenc)", value: "h264_nvenc" },
+                        { label: "Intel (qsv)", value: "h264_qsv" } ] }),
+                    tray.input({ label: "Public URL (blank = LAN IP), e.g. https://hls.example.com", fieldRef: publicRef }),
+                    tray.input({ label: "Port", fieldRef: portRef }),
                     tray.input({ label: "ffmpeg path", fieldRef: ffmpegRef }),
                     tray.input({ label: "python3 path", fieldRef: pythonRef }),
-                    tray.input({ label: "Output port", fieldRef: portRef }),
-                    tray.input({ label: "Public URL (blank = LAN IP), e.g. https://hls.example.com", fieldRef: publicRef }),
-                    tray.flex({
-                        items: [
-                            tray.button({ label: "Start", onClick: onStart, intent: "primary" }),
-                            tray.button({ label: "Stop", onClick: onStop, intent: "alert-subtle" }),
-                        ],
-                    }),
-                    tray.text(status.get()),
-                    tray.text(outUrl.get() || "", { style: { wordBreak: "break-all", userSelect: "text" } }),
-                    ...(debug.get() ? [tray.text(debug.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
+                    tray.input({ label: "Seanime server URL (local)", fieldRef: seanimeRef }),
+                    ...(note.get() ? [tray.text(note.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
                 ],
             }),
         )
+
+        // Start automatically when Seanime starts
+        start()
     })
 }
