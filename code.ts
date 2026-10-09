@@ -15,13 +15,15 @@ function init() {
         const link = ctx.state<string>("")
         const note = ctx.state<string>("")
 
-        // Persisted settings (the key is generated once and kept)
+        // Persisted settings. The access key is kept in plugin storage AND in a file, so it survives reloads.
         const saved = (k: string, d: string) => { try { return $storage.get<string>("ut." + k) ?? d } catch (e) { return d } }
-        let key = saved("key", "")
-        if (!key) {
-            for (let i = 0; i < 24; i++) key += Math.floor(Math.random() * 16).toString(16)
-            try { $storage.set("ut.key", key) } catch (e) { }
+        const keyFile = $filepath.join($os.tempDir(), "seanime-transcode-key.txt")
+        let initialKey = saved("key", "")
+        if (!initialKey) { try { initialKey = $toString($os.readFile(keyFile)).trim() } catch (e) { } }
+        if (!initialKey) {
+            for (let i = 0; i < 24; i++) initialKey += Math.floor(Math.random() * 16).toString(16)
         }
+        const keyRef = ctx.fieldRef<string>(initialKey)
 
         const pythonRef = ctx.fieldRef<string>(saved("python", "/usr/bin/python3"))
         const ffmpegRef = ctx.fieldRef<string>(saved("ffmpeg", "/opt/homebrew/bin/ffmpeg"))
@@ -66,6 +68,10 @@ A = ap.parse_args()
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
 LOCAL = A.seanime.rstrip("/")
+# Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
+# even if the access key changed. Anything on the web can't read it.
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(A.root)), "seanime-transcode-%d.token" % A.port)
+SHUTDOWN_TOKEN = secrets.token_hex(16)
 lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None}
 
@@ -232,8 +238,8 @@ class H(http.server.SimpleHTTPRequestHandler):
                                                "code": p.poll() if p else None}), "application/json")
         if path == "/shutdown":
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            if not A.key or not hmac.compare_digest(q.get("key", [""])[0], A.key):
-                return self.reply(403, "bad key")
+            if not hmac.compare_digest(q.get("token", [""])[0], SHUTDOWN_TOKEN):
+                return self.reply(403, "bad token")
             self.reply(200, "bye")
             threading.Thread(target=lambda: (time.sleep(0.3), stop_current(), os._exit(0)), daemon=True).start()
             return
@@ -249,7 +255,9 @@ class H(http.server.SimpleHTTPRequestHandler):
         # src must come last: it may contain its own ?token=... which would otherwise be split off
         params = {k: v[0] for k, v in urllib.parse.parse_qs(q[:i]).items()}
         if A.key and not hmac.compare_digest(params.get("key", ""), A.key):
-            return self.reply(403, "bad key")
+            return self.reply(403, "bad key: the key in this link does not match the running server.\\n"
+                                   "Open the Universal Transcode tray in Seanime, press 'Start / apply settings', "
+                                   "copy the link it shows and paste it into Seanime's External player link again.")
         rawsrc = q[i + 4:]
         if rawsrc.strip() in ("", "{url}", "%7Burl%7D"):
             return self.reply(400, "Seanime did not fill in {url}. This link must be opened by Seanime itself "
@@ -278,8 +286,15 @@ atexit.register(lambda: stop_current())
 
 # If an older instance (e.g. left over from a plugin reload) holds the port, ask it to quit first.
 try:
-    urllib.request.urlopen("http://127.0.0.1:%d/shutdown?key=%s" % (A.port, urllib.parse.quote(A.key)), timeout=2).read()
+    old = open(TOKEN_FILE).read().strip()
+    urllib.request.urlopen("http://127.0.0.1:%d/shutdown?token=%s" % (A.port, old), timeout=2).read()
     time.sleep(1)
+except Exception:
+    pass
+try:
+    with open(TOKEN_FILE, "w") as f:
+        f.write(SHUTDOWN_TOKEN)
+    os.chmod(TOKEN_FILE, 0o600)
 except Exception:
     pass
 
@@ -305,6 +320,8 @@ except KeyboardInterrupt:
                 sub: subRef.current, audio: audioRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
+            try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
+            try { $os.mkdirAll($os.tempDir(), 0o755); $os.writeFile(keyFile, $toBytes(keyRef.current.trim()), 0o600) } catch (e) { }
         }
 
         function stop() {
@@ -312,6 +329,12 @@ except KeyboardInterrupt:
         }
 
         function start() {
+            // never run without a key (an empty key would leave /play open to anyone who can reach it)
+            if (!keyRef.current.trim()) {
+                let k = ""
+                for (let i = 0; i < 24; i++) k += Math.floor(Math.random() * 16).toString(16)
+                keyRef.setValue(k)
+            }
             persist()
             stop()
             try {
@@ -322,7 +345,7 @@ except KeyboardInterrupt:
                     pythonRef.current.trim() || "python3", script,
                     "--root", root, "--port", portRef.current.trim(),
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
-                    "--key", key, "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
+                    "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
                 )
             } catch (e) {
@@ -342,11 +365,11 @@ except KeyboardInterrupt:
                 ctx.setTimeout(() => {
                     try { host = $toString($os.readFile($filepath.join(root, "ip.txt"))).trim() } catch (e) { }
                     const b = `http://${host || "localhost"}:${portRef.current.trim()}`
-                    link.set(`${b}/play?key=${key}&src={url}`)
+                    link.set(`${b}/play?key=${keyRef.current.trim()}&src={url}`)
                 }, 1500)
-                link.set(`http://localhost:${portRef.current.trim()}/play?key=${key}&src={url}`)
+                link.set(`http://localhost:${portRef.current.trim()}/play?key=${keyRef.current.trim()}&src={url}`)
             } else {
-                link.set(`${base}/play?key=${key}&src={url}`)
+                link.set(`${base}/play?key=${keyRef.current.trim()}&src={url}`)
             }
             status.set("Server running")
             ctx.toast.success("Transcode server started")
@@ -381,6 +404,7 @@ except KeyboardInterrupt:
                     tray.input({ label: "ffmpeg path", fieldRef: ffmpegRef }),
                     tray.input({ label: "python3 path", fieldRef: pythonRef }),
                     tray.input({ label: "Seanime server URL (local)", fieldRef: seanimeRef }),
+                    tray.input({ label: "Access key (part of the link; changing it means re-pasting the link in Seanime)", fieldRef: keyRef }),
                     ...(note.get() ? [tray.text(note.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
                 ],
             }),
