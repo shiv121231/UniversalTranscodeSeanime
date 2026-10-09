@@ -3,7 +3,7 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v0.4
+// Universal Transcode v0.5 — Video.js web player
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
 // link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
 
@@ -49,7 +49,7 @@ Seanime's "External player link" setting opens a URL of your choice with the str
 Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server will:
   1. take the stream URL (the path + token), swap the host for the local Seanime server,
   2. run ffmpeg to produce H.264/AAC HLS with soft WebVTT subtitles,
-  3. redirect the browser to a small hls.js player page.
+  3. redirect the browser to a Video.js player page.
 It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
 """
 import argparse, atexit, base64, hmac, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.parse, urllib.request
@@ -71,7 +71,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -81,37 +81,90 @@ lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None}
 
 PLAYER = """<!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Universal Transcode</title>
-<body style="margin:0;background:#000;color:#ccc;font-family:sans-serif">
-<video id="v" controls autoplay playsinline style="width:100vw;height:100vh"></video>
-<div id="m" style="position:fixed;top:12px;left:12px;font-size:14px">Starting transcode...</div>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5/dist/hls.min.js"></script>
+<link href="https://vjs.zencdn.net/8.23.4/video-js.css" rel="stylesheet">
+<style>
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; color:#eee; font-family:system-ui,sans-serif; }
+  #stage { position:relative; width:100%; height:100%; background:#000; }
+  #v { width:100%; height:100%; }
+  #m { position:absolute; z-index:5; top:16px; left:16px; right:16px; padding:10px 12px; border-radius:6px; background:rgba(0,0,0,.72); font-size:14px; }
+  .video-js .vjs-control-bar { font-size:14px; }
+  .video-js .vjs-big-play-button { left:50%; top:50%; transform:translate(-50%,-50%); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="v" class="video-js vjs-default-skin vjs-big-play-centered" controls autoplay playsinline preload="auto"></video>
+  <div id="m" role="status" aria-live="polite">Starting transcode…</div>
+</div>
+<script src="https://vjs.zencdn.net/8.23.4/video.min.js"></script>
 <script>
-var v = document.getElementById('v'), m = document.getElementById('m'), src = 'index.m3u8';
-function begin() {
-  m.style.display = 'none';
-  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = src; return; }
-  if (window.Hls && Hls.isSupported()) { var h = new Hls(); h.loadSource(src); h.attachMedia(v); }
-  else m.style.display = 'block', m.textContent = 'This browser cannot play HLS.';
-}
-function wait() {
-  fetch(src).then(function (r) { if (!r.ok) throw 0; begin(); })
-    .catch(function () {
-      fetch('/status').then(function (r) { return r.json(); }).then(function (s) {
-        if (s.exited && s.code !== 0) { m.textContent = 'ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.'; return; }
-        setTimeout(wait, 1500);
-      }).catch(function () { setTimeout(wait, 1500); });
+(function () {
+  var message = document.getElementById('m');
+  var source = 'index.m3u8';
+  var player = videojs('v', {
+    controls: true,
+    autoplay: true,
+    preload: 'auto',
+    fluid: false,
+    responsive: true,
+    liveui: false,
+    html5: { vhs: { overrideNative: !videojs.browser.IS_SAFARI } }
+  });
+
+  function show(text) { message.textContent = text; message.style.display = 'block'; }
+  function hideMessage() { message.style.display = 'none'; }
+  function begin() {
+    player.src({ src: source, type: 'application/x-mpegURL' });
+    player.ready(function () {
+      player.play().catch(function () { show('Press play to start playback.'); });
     });
-}
-wait();
-// Bridge mode: report position/pause state so IINA (and so Seanime's progress tracking) follows this player.
-var qk = new URLSearchParams(location.search).get('key'), sid = location.pathname.split('/')[1];
-if (qk) setInterval(function () {
-  if (!v.currentTime && v.paused) return;
-  fetch('/sync?key=' + encodeURIComponent(qk) + '&sid=' + sid + '&t=' + v.currentTime.toFixed(1) + '&p=' + (v.paused ? 1 : 0)).catch(function () {});
-}, 5000);
+  }
+  function waitForPlaylist() {
+    fetch(source, { cache: 'no-store' }).then(function (response) {
+      if (!response.ok) throw new Error('playlist not ready');
+      hideMessage();
+      begin();
+    }).catch(function () {
+      fetch('/status', { cache: 'no-store' }).then(function (response) { return response.json(); }).then(function (status) {
+        if (status.exited && status.code !== 0) {
+          show('ffmpeg failed (exit code ' + status.code + '). Check ffmpeg.log in the transcode temp folder.');
+          return;
+        }
+        show('Starting transcode…');
+        setTimeout(waitForPlaylist, 1500);
+      }).catch(function () {
+        show('Waiting for the stream…');
+        setTimeout(waitForPlaylist, 1500);
+      });
+    });
+  }
+  player.on('playing', hideMessage);
+  player.on('error', function () {
+    var error = player.error();
+    show(error && error.message ? 'Video.js: ' + error.message : 'Unable to play this stream.');
+  });
+  waitForPlaylist();
+
+  // Bridge mode: report position/pause state so IINA (and Seanime progress tracking) follows this player.
+  var key = new URLSearchParams(location.search).get('key');
+  var sessionId = location.pathname.split('/')[1];
+  if (key) setInterval(function () {
+    var time = player.currentTime();
+    if ((!time || !isFinite(time)) && player.paused()) return;
+    fetch('/sync?key=' + encodeURIComponent(key) + '&sid=' + encodeURIComponent(sessionId) +
+      '&t=' + (isFinite(time) ? time : 0).toFixed(1) + '&p=' + (player.paused() ? 1 : 0), { cache: 'no-store' }).catch(function () {});
+  }, 5000);
+
+  window.addEventListener('beforeunload', function () { try { player.dispose(); } catch (e) {} });
+})();
 </script>
+</body>
+</html>
 """
 
 
