@@ -1,7 +1,7 @@
 {
     "id": "universal-transcode",
     "name": "Universal Transcode",
-    "version": "0.4.2",
+    "version": "0.5.0",
     "manifestURI": "https://raw.githubusercontent.com/shiv121231/UniversalTranscodeSeanime/refs/heads/main/manifest.json",
     "language": "typescript",
     "type": "plugin",
