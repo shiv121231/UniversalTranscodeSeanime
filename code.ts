@@ -48,7 +48,7 @@ Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server w
   3. redirect the browser to a small hls.js player page.
 It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
 """
-import argparse, atexit, hmac, http.server, json, os, secrets, shutil, socket, subprocess, sys, threading, urllib.parse
+import argparse, atexit, base64, hmac, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.parse, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
@@ -153,14 +153,48 @@ def start_transcode(src, o):
         return sid
 
 
+def normalize_src(raw):
+    """Accept the stream URL in whatever form Seanime hands it over:
+    plain, percent-encoded (maybe twice), base64, or wrapped inside another scheme (iina://...?url=http...)."""
+    raw = raw.strip()
+    isurl = lambda x: x.lower().startswith(("http://", "https://", "/api/"))
+    for _ in range(3):
+        if isurl(raw):
+            break
+        d = urllib.parse.unquote(raw)
+        if d != raw:
+            raw = d
+            continue
+        try:
+            dec = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+            if isurl(dec) or "http" in dec[:40]:
+                raw = dec
+                continue
+        except Exception:
+            pass
+        break
+    if not isurl(raw):
+        m = re.search(r"https?://\\S+", raw)  # wrapped, e.g. iina://weblink?url=http://...
+        if m:
+            raw = m.group(0)
+            if raw.lower().startswith(("http%3a", "https%3a")):
+                raw = urllib.parse.unquote(raw)
+    return raw
+
+
 def local_stream_url(raw):
-    """Turn whatever Seanime handed us into a URL on the local Seanime server (path + token kept)."""
-    if raw.lower().startswith(("http%3a", "https%3a")):
-        raw = urllib.parse.unquote(raw)
-    u = urllib.parse.urlsplit(raw)
+    """Turn the stream URL into a URL on the local Seanime server (path + token kept)."""
+    u = urllib.parse.urlsplit(normalize_src(raw))
     if not u.path.startswith("/api/v1/") or "stream" not in u.path:
         return None
     return LOCAL + u.path + ("?" + u.query if u.query else "")
+
+
+def describe(raw):
+    """Safe description of what we received (no query string, so no token) for error messages."""
+    n = normalize_src(raw)
+    u = urllib.parse.urlsplit(n)
+    return "received (query removed): %s" % ((u.scheme + "://" if u.scheme else "") + u.netloc + u.path)[:200]
 
 
 class H(http.server.SimpleHTTPRequestHandler):
@@ -196,6 +230,13 @@ class H(http.server.SimpleHTTPRequestHandler):
             p = current["proc"]
             return self.reply(200, json.dumps({"exited": bool(p and p.poll() is not None),
                                                "code": p.poll() if p else None}), "application/json")
+        if path == "/shutdown":
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            if not A.key or not hmac.compare_digest(q.get("key", [""])[0], A.key):
+                return self.reply(403, "bad key")
+            self.reply(200, "bye")
+            threading.Thread(target=lambda: (time.sleep(0.3), stop_current(), os._exit(0)), daemon=True).start()
+            return
         if path == "/":
             return self.reply(200, "Universal Transcode is running. Use /play?key=KEY&src=STREAM_URL")
         return super().do_GET()
@@ -209,9 +250,13 @@ class H(http.server.SimpleHTTPRequestHandler):
         params = {k: v[0] for k, v in urllib.parse.parse_qs(q[:i]).items()}
         if A.key and not hmac.compare_digest(params.get("key", ""), A.key):
             return self.reply(403, "bad key")
-        src = local_stream_url(q[i + 4:])
+        rawsrc = q[i + 4:]
+        if rawsrc.strip() in ("", "{url}", "%7Burl%7D"):
+            return self.reply(400, "Seanime did not fill in {url}. This link must be opened by Seanime itself "
+                                   "(External player link), not typed into the address bar.")
+        src = local_stream_url(rawsrc)
         if not src:
-            return self.reply(400, "src is not a Seanime stream URL")
+            return self.reply(400, "src is not a Seanime stream URL (it must have a path like /api/v1/.../stream...)\\n" + describe(rawsrc))
         o = {"sub": params.get("sub", A.sub), "audio": params.get("audio", A.audio),
              "height": params.get("h", A.height), "crf": params.get("crf", A.crf),
              "enc": params.get("enc", A.encoder)}
@@ -230,8 +275,25 @@ except Exception:
     pass
 
 atexit.register(lambda: stop_current())
+
+# If an older instance (e.g. left over from a plugin reload) holds the port, ask it to quit first.
 try:
-    http.server.ThreadingHTTPServer(("0.0.0.0", A.port), H).serve_forever()
+    urllib.request.urlopen("http://127.0.0.1:%d/shutdown?key=%s" % (A.port, urllib.parse.quote(A.key)), timeout=2).read()
+    time.sleep(1)
+except Exception:
+    pass
+
+httpd = None
+for _ in range(10):
+    try:
+        httpd = http.server.ThreadingHTTPServer(("0.0.0.0", A.port), H)
+        break
+    except OSError:
+        time.sleep(1)
+if httpd is None:
+    sys.exit("port %d is in use by something that would not quit" % A.port)
+try:
+    httpd.serve_forever()
 except KeyboardInterrupt:
     pass
 `
