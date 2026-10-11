@@ -6,7 +6,7 @@
     "language": "typescript",
     "type": "plugin",
     "description": "Transcodes torrent (and other) Seanime streams to H.264/AAC HLS and opens a Video.js 10 (neutral skin) web player. Subtitle track, delay and style controls live in the player's own Captions menu. Set it as Seanime's external player link.",
-    "author": "you",
+    "author": "shiv121231",
     "icon": "",
     "website": "",
     "readme": "",
