@@ -3,7 +3,7 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v0.7 — Video.js 10 (neutral skin) web player, all subtitle tracks, subtitle delay
+// Universal Transcode v0.8 — Video.js 10 (neutral skin) web player, subtitle controls inside its Captions menu, lower RAM
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
 // link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
 
@@ -37,6 +37,8 @@ function init() {
         const subRef = ctx.fieldRef<string>(saved("sub", "auto")) // default subtitle: auto | none (blank) | track number | language code
         const audioRef = ctx.fieldRef<string>(saved("audio", "0"))
         const iinaRef = ctx.fieldRef<string>(saved("iina", "")) // blank = bridge off; e.g. /tmp/iina_socket
+        const memRef = ctx.fieldRef<string>(saved("mem", "balanced")) // ffmpeg memory profile: low | balanced | full
+        const idleRef = ctx.fieldRef<string>(saved("idle", "10")) // minutes without a viewer before ffmpeg is stopped (0 = never)
 
         let server: any = null
         const root = $filepath.join($os.tempDir(), "seanime-transcode")
@@ -66,6 +68,10 @@ ap.add_argument("--crf", default="18")
 ap.add_argument("--height", default="1080")
 ap.add_argument("--audio", default="0")
 ap.add_argument("--sub", default="auto", help="default subtitle: auto | none | track number | language code (eng)")
+ap.add_argument("--memory", default="balanced", choices=["low", "balanced", "full"],
+                help="ffmpeg memory profile: low (~half the RAM of full), balanced, full (auto threads, old behaviour)")
+ap.add_argument("--idle-stop", type=int, default=600,
+                help="stop the transcode and delete its files after this many seconds with no viewer (0 = never)")
 ap.add_argument("--ffprobe", default="", help="path to ffprobe (default: next to ffmpeg, else PATH)")
 ap.add_argument("--iina-socket", default="", help="bridge mode: IINA/mpv IPC socket, e.g. /tmp/iina_socket")
 ap.add_argument("--keep-iina-audio", action="store_true", help="bridge mode: do not mute IINA")
@@ -73,7 +79,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -81,7 +87,7 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(A.root)), "seanime-tra
 SHUTDOWN_TOKEN = secrets.token_hex(16)
 lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None, "ready": None, "state": "idle", "tracks": [], "skipped": [],
-           "default": None, "probe_error": ""}
+           "default": None, "probe_error": "", "src": None, "last": 0.0}
 
 PLAYER_TEMPLATE = r'''<!doctype html>
 <html lang="en">
@@ -93,23 +99,43 @@ PLAYER_TEMPLATE = r'''<!doctype html>
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
   video-player, video-neutral-skin, hlsjs-video { display: block; width: 100vw; height: 100vh; }
-  #ut-ui { position: fixed; inset: 0; z-index: 2147483000; pointer-events: none; font-size: 14px; }
-  #ut-msg { position: absolute; top: 16px; left: 16px; right: 16px; padding: 10px 12px; border-radius: 6px; background: rgba(0,0,0,.72); pointer-events: auto; }
-  #ut-btn, #ut-panel { pointer-events: auto; }
-  #ut-btn { position: absolute; top: max(12px, env(safe-area-inset-top)); right: 12px; padding: 7px 12px; border: 0; border-radius: 6px;
-            background: rgba(0,0,0,.6); color: #fff; font: inherit; cursor: pointer; transition: opacity .3s; }
-  #ut-ui.idle #ut-btn:not(.open) { opacity: 0; }
-  #ut-panel { position: absolute; top: calc(max(12px, env(safe-area-inset-top)) + 40px); right: 12px; width: min(340px, calc(100vw - 24px));
-              max-height: calc(100vh - 80px); overflow: auto; padding: 12px; border-radius: 8px; background: rgba(20,20,20,.94); display: none; }
-  #ut-panel.open { display: block; }
-  #ut-panel h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #aaa; }
-  #ut-panel h4:first-child { margin-top: 0; }
-  #ut-panel label.tr { display: flex; gap: 8px; align-items: center; padding: 5px 2px; cursor: pointer; }
-  #ut-panel .row { display: flex; gap: 8px; align-items: center; }
-  #ut-panel input[type=range] { flex: 1; min-width: 0; }
-  #ut-panel button { font: inherit; color: #fff; background: #333; border: 0; border-radius: 5px; padding: 5px 9px; cursor: pointer; }
-  #ut-panel .val { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
-  #ut-panel .hint { margin-top: 8px; font-size: 12px; color: #999; }
+  #ut-msg { position: fixed; top: 16px; left: 16px; right: 16px; z-index: 2147483000; padding: 10px 12px; border-radius: 6px;
+            background: rgba(0,0,0,.72); font-size: 14px; pointer-events: none; }
+
+  /* subtitle overlay (drawn by us so every style option works the same in every browser) */
+  #ut-subs { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 5; }
+  #ut-subs .ut-box { position: absolute; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: .12em;
+                     transition: bottom .18s ease; }
+  #ut-subs .ut-t { white-space: pre-wrap; }
+  #ut-toast { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 6; padding: 6px 12px; border-radius: 6px;
+              background: rgba(0,0,0,.7); color: #fff; font: 14px system-ui, sans-serif; pointer-events: none; opacity: 0; transition: opacity .2s; }
+  #ut-toast.on { opacity: 1; }
+
+  /* controls injected into Video.js's Captions menu (or the fallback card) */
+  .ut-ctl { box-sizing: border-box; padding: 8px 12px 10px; font-size: 12px; line-height: 1.35; color: inherit; text-align: left;
+            border-top: 1px solid rgba(255,255,255,.14); max-height: 52vh; overflow-y: auto; accent-color: var(--media-accent-color, #fff); }
+  .ut-ctl * { box-sizing: border-box; }
+  .ut-ctl h5 { margin: 8px 0 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .65; }
+  .ut-ctl h5:first-child { margin-top: 0; }
+  .ut-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; min-height: 24px; }
+  .ut-row > label { flex: 0 0 76px; opacity: .85; }
+  .ut-row input[type=range] { flex: 1; min-width: 0; margin: 0; }
+  .ut-row input[type=text] { flex: 1; min-width: 0; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: inherit; font: inherit; }
+  .ut-val { flex: 0 0 52px; text-align: right; font-variant-numeric: tabular-nums; opacity: .9; }
+  .ut-ctl button { font: inherit; color: inherit; background: rgba(255,255,255,.12); border: 0; border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+  .ut-ctl button:hover { background: rgba(255,255,255,.2); }
+  .ut-ctl button.on { background: var(--media-accent-color, #fff); color: var(--media-accent-text-color, #000); }
+  .ut-seg { display: flex; flex-wrap: wrap; gap: 3px; flex: 1; }
+  .ut-sw { width: 20px; height: 20px; padding: 0 !important; border-radius: 50% !important; border: 2px solid rgba(255,255,255,.35) !important; }
+  .ut-sw.on { border-color: #fff !important; outline: 2px solid var(--media-accent-color, #fff); }
+  .ut-ctl details { margin: 6px 0; border-top: 1px solid rgba(255,255,255,.1); padding-top: 4px; }
+  .ut-ctl summary { cursor: pointer; padding: 3px 0; font-weight: 600; }
+  .ut-note { margin-top: 6px; opacity: .6; font-size: 11px; }
+  #ut-fab { position: fixed; top: max(12px, env(safe-area-inset-top)); right: 12px; z-index: 2147483000; padding: 7px 12px; border: 0; border-radius: 6px;
+            background: rgba(0,0,0,.6); color: #fff; font: 14px system-ui, sans-serif; cursor: pointer; display: none; }
+  #ut-card { position: fixed; top: calc(max(12px, env(safe-area-inset-top)) + 40px); right: 12px; z-index: 2147483000; width: min(360px, calc(100vw - 24px));
+             border-radius: 8px; background: rgba(20,20,20,.95); color: #eee; display: none; }
+  #ut-card.open { display: block; }
 </style>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/video-neutral.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/media/hlsjs-video.js"></script>
@@ -117,27 +143,23 @@ PLAYER_TEMPLATE = r'''<!doctype html>
 <body>
 <video-player>
   <video-neutral-skin>
-    <hlsjs-video id="v" autoplay playsinline preload="auto" crossorigin="anonymous">
+    <hlsjs-video id="v" autoplay playsinline preload="auto" crossorigin="anonymous" stream-type="on-demand">
 __TRACKS__
     </hlsjs-video>
   </video-neutral-skin>
 </video-player>
 
-<div id="ut-ui" class="idle">
-  <div id="ut-msg" role="status" aria-live="polite">Starting transcode...</div>
-  <button id="ut-btn" type="button" aria-haspopup="true" aria-expanded="false">Subtitles</button>
-  <div id="ut-panel" role="dialog" aria-label="Subtitles"></div>
-</div>
+<div id="ut-msg" role="status" aria-live="polite">Starting transcode...</div>
+<button id="ut-fab" type="button">Subtitles</button>
+<div id="ut-card"></div>
 
 <script id="ut-cfg" type="application/json">__CFG__</script>
 <script>
 (function () {
+  'use strict';
   var cfg = JSON.parse(document.getElementById('ut-cfg').textContent);
   var media = document.getElementById('v');
-  var ui = document.getElementById('ut-ui');
   var msg = document.getElementById('ut-msg');
-  var btn = document.getElementById('ut-btn');
-  var panel = document.getElementById('ut-panel');
   var params = new URLSearchParams(location.search);
   var key = params.get('key');
   var sid = location.pathname.split('/')[1];
@@ -145,183 +167,407 @@ __TRACKS__
 
   function show(t) { msg.textContent = t; msg.style.display = 'block'; }
   function hide() { msg.style.display = 'none'; }
+  function load(k, d) { try { var v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } }
+  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
-  // ------------------------------------------------------------ subtitle delay
-  // Cue times from the server are the ORIGINAL timestamps (same timeline as mpv/IINA).
-  // The delay is only ever added on top of those, so 0 = exactly what mpv shows.
-  var DELAY_KEY = 'ut.subdelay', delay = 0;
-  try { delay = parseFloat(localStorage.getItem(DELAY_KEY)) || 0; } catch (e) {}
-  function clamp(d) { return Math.max(-5, Math.min(5, Math.round(d * 100) / 100)); }
-  delay = clamp(delay);
+  // ================================================================ subtitle model
+  var FONTS = {
+    sans:   { label: 'Sans',       css: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "Noto Sans CJK JP", "Yu Gothic", "Microsoft YaHei", sans-serif' },
+    serif:  { label: 'Serif',      css: 'Georgia, "Times New Roman", "Hiragino Mincho ProN", "Noto Serif CJK JP", serif' },
+    mono:   { label: 'Mono',       css: 'ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace' },
+    rounded:{ label: 'Rounded',    css: 'ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Arial Rounded MT Bold", system-ui, sans-serif' },
+    casual: { label: 'Casual',     css: '"Comic Sans MS", "Chalkboard SE", "Marker Felt", cursive' },
+    caps:   { label: 'Small caps', css: 'Georgia, "Times New Roman", serif', variant: 'small-caps' }
+  };
+  var DEFAULTS = {
+    font: 'sans', fontCustom: '', size: 4.6, bold: false, italic: false, upper: false,
+    color: '#ffffff', opacity: 100, lineHeight: 1.25, spacing: 0,
+    bg: '#000000', bgOpacity: 0, pad: 0.25, radius: 0.15,
+    edge: 'outline', edgeColor: '#000000', edgeWidth: 4,
+    bottom: 7, lift: 7, width: 82, align: 'center'
+  };
+  var PRESETS = {
+    'Default':       {},
+    'Classic':       { color: '#ffe84a', edge: 'outline', edgeColor: '#000000', bold: true },
+    'Cinema':        { edge: 'none', bgOpacity: 62, pad: 0.3, radius: 0.2, size: 4.4 },
+    'High contrast': { bold: true, bgOpacity: 100, edge: 'none', size: 5.2, pad: 0.3, radius: 0 },
+    'Large print':   { size: 6.8, bold: true, edge: 'outline', edgeWidth: 5 },
+    'Soft shadow':   { edge: 'shadow', edgeColor: '#000000', edgeWidth: 4, bold: true }
+  };
+  var SWATCHES = ['#ffffff', '#ffe84a', '#7fe3ff', '#8dff8d', '#ff9ad5', '#ff6b6b', '#c9c9c9', '#000000'];
 
-  var tracks = cfg.tracks.map(function (t) { return { info: t, tt: null, cues: [], count: 0, busy: false, done: false }; });
+  var style = {};
+  (function () {
+    var stored = {};
+    try { stored = JSON.parse(load('ut.sub.style', '{}')) || {}; } catch (e) {}
+    for (var k in DEFAULTS) style[k] = (stored[k] !== undefined && typeof stored[k] === typeof DEFAULTS[k]) ? stored[k] : DEFAULTS[k];
+  })();
+  var styleVer = 1;
+  function setStyle(patch) { for (var k in patch) style[k] = patch[k]; styleVer++; save('ut.sub.style', JSON.stringify(style)); preview(); }
 
-  function shiftAll() {
-    tracks.forEach(function (t) {
-      t.cues.forEach(function (c) {
-        var s = Math.max(0, c.__o[0] + delay), e = Math.max(s + 0.001, c.__o[1] + delay);
-        c.startTime = s; c.endTime = e;
-      });
+  // Subtitle delay. Cue times stay the ORIGINAL timestamps (same timeline as mpv/IINA); the delay is added on lookup only.
+  var delay = parseFloat(load('ut.subdelay', '0')) || 0;
+  function clampDelay(d) { return Math.max(-5, Math.min(5, Math.round(d * 100) / 100)); }
+  delay = clampDelay(delay);
+  function setDelay(d) { delay = clampDelay(d); save('ut.subdelay', String(delay)); styleVer++; refreshControls(); }
+  function fmtDelay(d) { return (d > 0 ? '+' : d < 0 ? '-' : '') + Math.abs(d).toFixed(2) + ' s'; }
+
+  // ---------------------------------------------------------------- pure helpers (also exposed as window.__ut for debugging)
+  function hexRgba(hex, pct) {
+    var m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    var n = m ? parseInt(m[1], 16) : 0xffffff;
+    return 'rgba(' + (n >> 16 & 255) + ',' + (n >> 8 & 255) + ',' + (n & 255) + ',' + (Math.max(0, Math.min(100, pct)) / 100) + ')';
+  }
+  function ring(w, color) {                          // outline from text-shadows: works in every browser
+    var s = [], steps = 16;
+    for (var i = 0; i < steps; i++) {
+      var a = i / steps * Math.PI * 2;
+      s.push((Math.cos(a) * w).toFixed(2) + 'px ' + (Math.sin(a) * w).toFixed(2) + 'px 0 ' + color);
+    }
+    return s.join(',');
+  }
+  function edgeShadow(S, px) {
+    var w = Math.max(0.5, px * S.edgeWidth / 100), c = S.edgeColor;
+    switch (S.edge) {
+      case 'outline':   return S.edgeWidth > 0 ? ring(w, c) : 'none';
+      case 'shadow':    return (w * 0.9).toFixed(2) + 'px ' + (w * 0.9).toFixed(2) + 'px ' + (w * 1.6).toFixed(2) + 'px ' + c + ',0 0 ' + (w * 2).toFixed(2) + 'px ' + c;
+      case 'raised':    return (-w * 0.6).toFixed(2) + 'px ' + (-w * 0.6).toFixed(2) + 'px 0 rgba(255,255,255,.55),' + (w * 0.8).toFixed(2) + 'px ' + (w * 0.8).toFixed(2) + 'px 0 ' + c;
+      case 'depressed': return (w * 0.6).toFixed(2) + 'px ' + (w * 0.6).toFixed(2) + 'px 0 rgba(255,255,255,.55),' + (-w * 0.8).toFixed(2) + 'px ' + (-w * 0.8).toFixed(2) + 'px 0 ' + c;
+      default:          return 'none';
+    }
+  }
+  function cueCss(S, boxH) {                         // -> CSS properties for the text spans
+    var px = Math.max(8, boxH * S.size / 100);
+    var f = FONTS[S.font] || FONTS.sans;
+    var family = (S.font === 'custom' && S.fontCustom) ? '"' + S.fontCustom.replace(/["\\\\;{}]/g, '') + '", ' + FONTS.sans.css : f.css;
+    return {
+      fontFamily: family, fontSize: px.toFixed(1) + 'px', fontWeight: S.bold ? '700' : '400', fontStyle: S.italic ? 'italic' : 'normal',
+      fontVariant: f.variant || 'normal', textTransform: S.upper ? 'uppercase' : 'none',
+      color: hexRgba(S.color, S.opacity), lineHeight: String(S.lineHeight), letterSpacing: S.spacing + 'em',
+      background: S.bgOpacity > 0 ? hexRgba(S.bg, S.bgOpacity) : 'transparent',
+      padding: S.bgOpacity > 0 ? '0.05em ' + S.pad + 'em' : '0', borderRadius: S.radius + 'em',
+      textShadow: edgeShadow(S, px)
+    };
+  }
+  // cue text -> safe HTML (VTT text: allow <i><b><u>, keep &amp; &lt; &gt; &nbsp; entities, drop every other tag)
+  function fmt(text) {
+    var s = String(text)
+      .replace(/<(\\/?)([ibu])>/gi, '\\u0001$1$2\\u0002')
+      .replace(/<[^>]*>/g, '')
+      .replace(/[<>]/g, function (c) { return c === '<' ? '&lt;' : '&gt;'; })
+      .replace(/&(?!(?:amp|lt|gt|nbsp|lrm|rlm);)/g, '&amp;');
+    var stack = [];                                    // keep <i>/<b>/<u> balanced so nothing leaks into the next line
+    s = s.replace(/\\u0001(\\/?)([ibu])\\u0002/g, function (m, close, tag) {
+      if (!close) { stack.push(tag); return '<' + tag + '>'; }
+      var i = stack.lastIndexOf(tag);
+      if (i < 0) return '';
+      var out = '';
+      while (stack.length - 1 > i) out += '</' + stack.pop() + '>';
+      stack.pop();
+      return out + '</' + tag + '>';
     });
+    while (stack.length) s += '</' + stack.pop() + '>';
+    return s.replace(/[\\u0001\\u0002]/g, '').replace(/\\n/g, '<br>');
   }
-  function setDelay(d) {
-    delay = clamp(d);
-    try { localStorage.setItem(DELAY_KEY, String(delay)); } catch (e) {}
-    shiftAll(); renderValue();
+  // cues sorted by start time; returns those showing at time t (with the delay applied)
+  function activeAt(list, t, d, maxDur) {
+    var lo = 0, hi = list.length;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (list[mid][0] + d <= t) lo = mid + 1; else hi = mid; }
+    var out = [];
+    for (var i = lo - 1; i >= 0; i--) {
+      var c = list[i];
+      if (c[0] + d < t - maxDur) break;
+      if (c[1] + d > t) out.push(c);
+    }
+    return out.reverse();
   }
 
-  // ------------------------------------------------------------ text tracks
-  // <track> elements in the markup make the tracks known to the player (and its captions UI).
-  // Cues are then fed in progressively from the server while the transcode runs.
+  // ================================================================ cue store (compact arrays, selected track only)
+  var tracks = cfg.tracks.map(function (t) { return { info: t, tt: null, list: [], maxDur: 0, off: 0, busy: false, done: false }; });
+  var selected = null;                                // the track object that is showing
+  var didInit = false;
+
   function findTT(t) {
     var list = media.textTracks;
     if (list) {
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].id === t.info.id) return list[i];
-      }
-      for (var j = 0; j < list.length; j++) {
-        if (list[j].label === t.info.label && list[j].language === t.info.lang) return list[j];
-      }
+      for (var i = 0; i < list.length; i++) if (list[i].id === t.info.id) return list[i];
+      for (var j = 0; j < list.length; j++) if (list[j].label === t.info.label && list[j].language === t.info.lang) return list[j];
     }
-    // Fallback: the media element did not pick up our <track> children
-    if (Date.now() - t0 > 3000 && media.addTextTrack) {
-      var made = media.addTextTrack('subtitles', t.info.label, t.info.lang);
-      if (made) return made;
-    }
+    if (Date.now() - t0 > 3000 && media.addTextTrack) { var made = media.addTextTrack('subtitles', t.info.label, t.info.lang); if (made) return made; }
     return null;
   }
-
-  function addCues(t, rows) {
-    rows.forEach(function (r) {
-      var c = new VTTCue(r[0], r[1], r[2]);
-      c.__o = [r[0], r[1]];
-      if (delay) { c.startTime = Math.max(0, r[0] + delay); c.endTime = Math.max(c.startTime + 0.001, r[1] + delay); }
-      t.tt.addCue(c);
-      t.cues.push(c);
+  function release(t) { t.list = []; t.maxDur = 0; t.off = 0; t.done = false; }   // free memory of tracks that are not showing
+  function readSelection() {
+    var now = null;
+    tracks.forEach(function (t) {
+      if (!t.tt) t.tt = findTT(t);
+      if (t.tt && t.tt.mode === 'showing' && !now) now = t;
     });
-    t.count += rows.length;
+    if (now !== selected) { if (selected) release(selected); selected = now; styleVer++; renderTrackButtons(); }
   }
-
-  var didInit = false;
+  function setTrack(t) {                               // t = track object or null (off)
+    tracks.forEach(function (x) { if (!x.tt) x.tt = findTT(x); if (x.tt) x.tt.mode = (x === t) ? 'showing' : 'disabled'; });
+    readSelection();
+  }
   function initialSelect() {
-    // wait (briefly) until the media element has exposed our tracks, then switch the default one on
     var all = tracks.every(function (t) { if (!t.tt) t.tt = findTT(t); return !!t.tt; });
     if (!all && Date.now() - t0 < 4000) return false;
     didInit = true;
-    var idx = -1;
-    tracks.forEach(function (t, k) { if (t.info.id === cfg.default) idx = k; });
-    if (idx >= 0) selectTrack(idx);
+    var d = null;
+    tracks.forEach(function (t) { if (t.info.id === cfg.default) d = t; });
+    if (d) setTrack(d); else readSelection();
     return true;
   }
-
   function pump() {
+    if (!tracks.length) return;
     if (!didInit && !initialSelect()) return;
-    tracks.forEach(function (t) {
-      if (t.busy || t.done) return;
-      if (!t.tt) t.tt = findTT(t);
-      if (!t.tt || t.tt.mode === 'disabled') return;   // only feed tracks that are on
-      t.busy = true;
-      fetch('cues?s=' + t.info.index + '&from=' + t.count, { cache: 'no-store' })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          if (j.cues && j.cues.length) addCues(t, j.cues);
-          if (!j.live && t.count >= j.total) t.done = true;
-        })
-        .catch(function () {})
-        .then(function () { t.busy = false; });
-    });
+    readSelection();
+    var t = selected;
+    if (!t || t.busy || t.done) return;
+    t.busy = true;
+    fetch('cues?s=' + t.info.index + '&off=' + t.off, { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (t !== selected) return;                    // switched away meanwhile
+        if (j.cues && j.cues.length) {
+          var needSort = false;
+          j.cues.forEach(function (c) {
+            if (t.list.length && c[0] < t.list[t.list.length - 1][0]) needSort = true;
+            t.list.push(c);
+            if (c[1] - c[0] > t.maxDur) t.maxDur = c[1] - c[0];
+          });
+          if (needSort) t.list.sort(function (a, b) { return a[0] - b[0]; });
+          styleVer++;
+        }
+        t.off = j.off; t.done = !!j.done;
+      })
+      .catch(function () {})
+      .then(function () { t.busy = false; });
   }
-  setInterval(pump, 3000);
+  setInterval(pump, 2000);
   if (media.textTracks && media.textTracks.addEventListener) {
-    media.textTracks.addEventListener('change', function () { pump(); renderTracks(); });
+    media.textTracks.addEventListener('change', function () { readSelection(); pump(); });
     media.textTracks.addEventListener('addtrack', function () { setTimeout(pump, 100); });
   }
 
-  function selectTrack(i) {            // i = index into tracks, or -1 for off
-    tracks.forEach(function (t, k) {
-      if (!t.tt) t.tt = findTT(t);
-      if (t.tt) t.tt.mode = (k === i) ? 'showing' : 'disabled';
-    });
-    pump(); renderTracks();
+  // ================================================================ overlay renderer
+  var host = null, overlay = null, box = null, toastEl = null, lastSig = '', previewUntil = 0, lastActivity = Date.now();
+  function findHost() {
+    return document.querySelector('media-container') || document.querySelector('video-neutral-skin') ||
+           document.querySelector('video-player') || document.body;
+  }
+  function ensureOverlay() {
+    var h = findHost();
+    if (!overlay) {
+      overlay = document.createElement('div'); overlay.id = 'ut-subs';
+      box = document.createElement('div'); box.className = 'ut-box'; overlay.appendChild(box);
+      toastEl = document.createElement('div'); toastEl.id = 'ut-toast';
+    }
+    if (overlay.parentNode !== h) {
+      if (h !== document.body && h.style && getComputedStyle(h).position === 'static') h.style.position = 'relative';
+      h.appendChild(overlay); h.appendChild(toastEl); host = h; lastSig = '';
+    }
+  }
+  function preview() { previewUntil = Date.now() + 2500; }
+  var toastTimer;
+  function toast(t) { ensureOverlay(); toastEl.textContent = t; toastEl.classList.add('on'); clearTimeout(toastTimer); toastTimer = setTimeout(function () { toastEl.classList.remove('on'); }, 1100); }
+
+  function controlsVisible() { return media.paused || Date.now() - lastActivity < 3000; }
+  function frame() {
+    requestAnimationFrame(frame);
+    if (document.hidden) return;
+    ensureOverlay();
+    var t = media.currentTime || 0;
+    var act = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
+    var sample = !act.length && Date.now() < previewUntil;
+    var h = overlay.clientHeight || 0;
+    var lift = controlsVisible() ? style.lift : 0;
+    var sig = [styleVer, Math.round(h), lift, sample ? 's' : '', act.map(function (c) { return c[0] + '|' + c[1]; }).join(',')].join('#');
+    if (sig === lastSig) return;
+    lastSig = sig;
+    var css = cueCss(style, h || 720);
+    box.style.bottom = (style.bottom + lift) + '%';
+    box.style.width = style.width + '%';
+    box.style.alignItems = style.align === 'left' ? 'flex-start' : style.align === 'right' ? 'flex-end' : 'center';
+    box.style.textAlign = style.align;
+    var rows = act.length ? act.map(function (c) { return fmt(c[2]); }) : (sample ? ['Sample subtitle text<br>second line'] : []);
+    box.innerHTML = rows.map(function (r) { return '<div><span class="ut-t">' + r + '</span></div>'; }).join('');
+    var spans = box.querySelectorAll('.ut-t');
+    for (var i = 0; i < spans.length; i++) {
+      for (var p in css) spans[i].style[p] = css[p];
+      spans[i].style.webkitBoxDecorationBreak = 'clone'; spans[i].style.boxDecorationBreak = 'clone';
+    }
   }
 
-  // ------------------------------------------------------------ panel (track list + delay)
-  var valEl, radios = [];
-  function fmt(d) { return (d > 0 ? '+' : d < 0 ? '-' : '') + Math.abs(d).toFixed(2) + ' s'; }
-  function renderValue() { if (valEl) valEl.textContent = fmt(delay); var s = panel.querySelector('input[type=range]'); if (s) s.value = delay; }
-  function renderTracks() {
-    radios.forEach(function (r) {
-      var t = r.t;
-      r.el.checked = t ? !!(t.tt && t.tt.mode === 'showing') : !tracks.some(function (x) { return x.tt && x.tt.mode === 'showing'; });
+  // ================================================================ controls (built once, mounted in Video.js's Captions menu)
+  var ctl = document.createElement('div'); ctl.className = 'ut-ctl';
+  var updaters = [], trackBtns = [];
+  function refreshControls() { updaters.forEach(function (u) { u(); }); }
+  function renderTrackButtons() { trackBtns.forEach(function (u) { u(); }); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function row(label, parent) { var r = el('div', 'ut-row'); if (label) r.appendChild(el('label', '', label)); parent.appendChild(r); return r; }
+  function slider(parent, label, k, min, max, step, f) {
+    var r = row(label, parent), inp = el('input'), val = el('span', 'ut-val');
+    inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step;
+    inp.addEventListener('input', function () { var p = {}; p[k] = parseFloat(inp.value); setStyle(p); val.textContent = f(style[k]); });
+    r.appendChild(inp); r.appendChild(val);
+    updaters.push(function () { inp.value = style[k]; val.textContent = f(style[k]); });
+  }
+  function seg(parent, label, k, opts) {
+    var r = row(label, parent), g = el('div', 'ut-seg'); r.appendChild(g); var bs = [];
+    opts.forEach(function (o) {
+      var b = el('button', '', o[1]); b.type = 'button';
+      b.addEventListener('click', function () { var p = {}; p[k] = o[0]; setStyle(p); refreshControls(); });
+      g.appendChild(b); bs.push([o[0], b]);
     });
+    updaters.push(function () { bs.forEach(function (x) { x[1].classList.toggle('on', style[k] === x[0]); }); });
+    return g;
   }
-  function build() {
-    var h = '<h4>Subtitles</h4><div id="ut-list"></div><h4>Delay</h4>' +
-      '<div class="row"><button type="button" id="ut-m">-0.1</button><input type="range" min="-5" max="5" step="0.05" value="0" aria-label="Subtitle delay">' +
-      '<button type="button" id="ut-p">+0.1</button></div>' +
-      '<div class="row" style="margin-top:6px"><span class="val" id="ut-val"></span><button type="button" id="ut-r">Reset</button></div>' +
-      '<div class="hint">Keys: z = -0.1 s, x = +0.1 s. 0 means the original timing (same as mpv/IINA). Positive = later.</div>';
-    if (cfg.skipped && cfg.skipped.length) {
-      h += '<div class="hint">Not available (image-based): ' + cfg.skipped.map(function (s) { return esc(s.label); }).join(', ') + '</div>';
-    }
-    if (cfg.probe_error) h += '<div class="hint">Could not read the subtitle list: ' + esc(cfg.probe_error) + '</div>';
-    panel.innerHTML = h;
-    var list = panel.querySelector('#ut-list');
-    function row(label, t) {
-      var l = document.createElement('label'); l.className = 'tr';
-      var r = document.createElement('input'); r.type = 'radio'; r.name = 'ut-sub';
-      r.addEventListener('change', function () { selectTrack(t ? tracks.indexOf(t) : -1); });
-      l.appendChild(r); l.appendChild(document.createTextNode(label));
-      list.appendChild(l); radios.push({ el: r, t: t });
-    }
-    row('Off', null);
-    tracks.forEach(function (t) { row(t.info.label, t); });
-    valEl = panel.querySelector('#ut-val');
-    var slider = panel.querySelector('input[type=range]');
-    slider.addEventListener('input', function () { setDelay(parseFloat(slider.value)); });
-    panel.querySelector('#ut-m').onclick = function () { setDelay(delay - 0.1); };
-    panel.querySelector('#ut-p').onclick = function () { setDelay(delay + 0.1); };
-    panel.querySelector('#ut-r').onclick = function () { setDelay(0); };
-    renderValue(); renderTracks();
+  function toggle(parent, label, k) {
+    var r = row(label, parent), b = el('button'); b.type = 'button';
+    b.addEventListener('click', function () { var p = {}; p[k] = !style[k]; setStyle(p); refreshControls(); });
+    r.appendChild(b); updaters.push(function () { b.textContent = style[k] ? 'On' : 'Off'; b.classList.toggle('on', !!style[k]); });
   }
-  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
-  build();
-  btn.addEventListener('click', function () {
-    var open = panel.classList.toggle('open'); btn.classList.toggle('open', open); btn.setAttribute('aria-expanded', open);
-  });
+  function colour(parent, label, k) {
+    var r = row(label, parent), g = el('div', 'ut-seg'), sws = [], hex = el('input'); r.appendChild(g);
+    SWATCHES.forEach(function (c) {
+      var b = el('button', 'ut-sw'); b.type = 'button'; b.style.background = c; b.title = c;
+      b.addEventListener('click', function () { var p = {}; p[k] = c; setStyle(p); refreshControls(); });
+      g.appendChild(b); sws.push([c, b]);
+    });
+    hex.type = 'text'; hex.maxLength = 7; hex.style.flex = '0 0 66px'; hex.placeholder = '#rrggbb';
+    hex.addEventListener('change', function () { if (/^#[0-9a-f]{6}$/i.test(hex.value)) { var p = {}; p[k] = hex.value.toLowerCase(); setStyle(p); refreshControls(); } });
+    r.appendChild(hex);
+    updaters.push(function () { hex.value = style[k]; sws.forEach(function (x) { x[1].classList.toggle('on', x[0] === style[k]); }); });
+  }
+  function section(title, open) { var d = el('details'); if (open) d.open = true; d.appendChild(el('summary', '', title)); ctl.appendChild(d); return d; }
+  var P = function (n) { return n + '%'; };
+
+  (function buildControls() {
+    // ---- tracks (a second way to pick a track; Video.js's own list above stays the main one)
+    if (tracks.length) {
+      ctl.appendChild(el('h5', '', 'Subtitle track'));
+      var tr = el('div', 'ut-row'); var tg = el('div', 'ut-seg'); tr.appendChild(tg); ctl.appendChild(tr);
+      var off = el('button', '', 'Off'); off.type = 'button'; off.addEventListener('click', function () { setTrack(null); }); tg.appendChild(off);
+      trackBtns.push(function () { off.classList.toggle('on', !selected); });
+      tracks.forEach(function (t) {
+        var b = el('button', '', t.info.label); b.type = 'button'; b.addEventListener('click', function () { setTrack(t); });
+        tg.appendChild(b); trackBtns.push(function () { b.classList.toggle('on', selected === t); });
+      });
+    }
+    // ---- timing
+    ctl.appendChild(el('h5', '', 'Subtitle timing'));
+    var dr = row('Delay', ctl), dm = el('button', '', '-0.1'), dp = el('button', '', '+0.1'), ds = el('input'), dv = el('span', 'ut-val');
+    dm.type = dp.type = 'button'; ds.type = 'range'; ds.min = -5; ds.max = 5; ds.step = 0.05;
+    dm.addEventListener('click', function () { setDelay(delay - 0.1); });
+    dp.addEventListener('click', function () { setDelay(delay + 0.1); });
+    ds.addEventListener('input', function () { setDelay(parseFloat(ds.value)); });
+    dr.appendChild(dm); dr.appendChild(ds); dr.appendChild(dp);
+    var dr2 = row('', ctl), dz = el('button', '', 'Reset'); dz.type = 'button'; dz.addEventListener('click', function () { setDelay(0); });
+    dr2.appendChild(el('span', '', '0 = original timing (same as mpv/IINA).')); dr2.appendChild(dv); dr2.appendChild(dz);
+    updaters.push(function () { ds.value = delay; dv.textContent = fmtDelay(delay); });
+
+    // ---- text
+    var tx = section('Text', true);
+    var fg = seg(tx, 'Font', 'font', Object.keys(FONTS).map(function (k) { return [k, FONTS[k].label]; }).concat([['custom', 'Custom']]));
+    var cr = row('', tx), cf = el('input'); cf.type = 'text'; cf.placeholder = 'Custom font name (e.g. Helvetica Neue)';
+    cf.addEventListener('change', function () { setStyle({ fontCustom: cf.value.trim(), font: cf.value.trim() ? 'custom' : style.font }); refreshControls(); });
+    cr.appendChild(cf); updaters.push(function () { cf.value = style.fontCustom; });
+    slider(tx, 'Size', 'size', 2, 10, 0.1, function (v) { return v.toFixed(1) + '%'; });
+    toggle(tx, 'Bold', 'bold'); toggle(tx, 'Italic', 'italic'); toggle(tx, 'UPPERCASE', 'upper');
+    colour(tx, 'Colour', 'color');
+    slider(tx, 'Opacity', 'opacity', 10, 100, 5, P);
+    slider(tx, 'Line height', 'lineHeight', 1, 2, 0.05, function (v) { return v.toFixed(2); });
+    slider(tx, 'Spacing', 'spacing', -0.05, 0.3, 0.01, function (v) { return v.toFixed(2); });
+
+    // ---- background & edge
+    var bg = section('Background & edge', false);
+    colour(bg, 'Box colour', 'bg');
+    slider(bg, 'Box opacity', 'bgOpacity', 0, 100, 5, P);
+    slider(bg, 'Box padding', 'pad', 0, 1, 0.05, function (v) { return v.toFixed(2); });
+    slider(bg, 'Corners', 'radius', 0, 0.6, 0.05, function (v) { return v.toFixed(2); });
+    seg(bg, 'Edge', 'edge', [['none', 'None'], ['outline', 'Outline'], ['shadow', 'Shadow'], ['raised', 'Raised'], ['depressed', 'Depressed']]);
+    colour(bg, 'Edge colour', 'edgeColor');
+    slider(bg, 'Edge width', 'edgeWidth', 0, 10, 0.5, P);
+
+    // ---- position
+    var ps = section('Position', false);
+    slider(ps, 'From bottom', 'bottom', 0, 40, 1, P);
+    slider(ps, 'Lift for bar', 'lift', 0, 20, 1, P);
+    slider(ps, 'Max width', 'width', 30, 100, 1, P);
+    seg(ps, 'Align', 'align', [['left', 'Left'], ['center', 'Centre'], ['right', 'Right']]);
+
+    // ---- presets
+    var pr = section('Presets', false), prow = row('', pr), pg = el('div', 'ut-seg'); prow.appendChild(pg);
+    Object.keys(PRESETS).forEach(function (n) {
+      var b = el('button', '', n); b.type = 'button';
+      b.addEventListener('click', function () { var p = {}; for (var k in DEFAULTS) p[k] = DEFAULTS[k]; for (var q in PRESETS[n]) p[q] = PRESETS[n][q]; setStyle(p); refreshControls(); });
+      pg.appendChild(b);
+    });
+    var rr = row('', pr), rb = el('button', '', 'Reset all style'); rb.type = 'button';
+    rb.addEventListener('click', function () { var p = {}; for (var k in DEFAULTS) p[k] = DEFAULTS[k]; setStyle(p); setDelay(0); refreshControls(); });
+    rr.appendChild(rb);
+    ctl.appendChild(el('div', 'ut-note', 'Keys: z = -0.1 s, x = +0.1 s. Settings are remembered in this browser.'));
+    refreshControls(); renderTrackButtons();
+  })();
+  // keep Video.js's menu and hotkeys from reacting to keys/clicks typed into our controls
+  ['keydown', 'keyup', 'keypress', 'click'].forEach(function (n) { ctl.addEventListener(n, function (e) { e.stopPropagation(); }); });
+
+  // ---------------------------------------------------------------- mounting: Video.js's Captions menu, else a small fallback card
+  var attached = false, fab = document.getElementById('ut-fab'), card = document.getElementById('ut-card');
+  function tryAttach() {
+    var g = document.querySelector('media-captions-radio-group');
+    if (!g || !g.parentNode) return false;
+    if (ctl.previousSibling !== g || ctl.parentNode !== g.parentNode) g.parentNode.insertBefore(ctl, g.nextSibling);
+    if (!attached) { attached = true; fab.style.display = 'none'; card.classList.remove('open'); try { console.log('[universal-transcode] subtitle controls added to the Captions menu'); } catch (e) {} }
+    return true;
+  }
+  if (tracks.length) {
+    var pending = false;
+    new MutationObserver(function () {
+      if (pending) return; pending = true;
+      requestAnimationFrame(function () { pending = false; tryAttach(); });
+    }).observe(document.body, { childList: true, subtree: true });
+    tryAttach();
+    setTimeout(function () {
+      if (attached) return;
+      try { console.warn('[universal-transcode] could not find the Captions menu; using the fallback button'); } catch (e) {}
+      card.appendChild(ctl); fab.style.display = 'block';
+      fab.addEventListener('click', function () { card.classList.toggle('open'); });
+    }, 6000);
+  }
+
+  // hotkeys: z / x nudge the delay by 0.1 s (same keys as mpv)
   document.addEventListener('keydown', function (e) {
     var tag = (e.target && e.target.tagName) || '';
-    if (e.ctrlKey || e.metaKey || e.altKey || /INPUT|TEXTAREA|SELECT/.test(tag) && e.target.type !== 'range') return;
-    if (e.key === 'z') { setDelay(delay - 0.1); flash('Subtitle delay ' + fmt(delay)); }
-    else if (e.key === 'x') { setDelay(delay + 0.1); flash('Subtitle delay ' + fmt(delay)); }
+    if (e.ctrlKey || e.metaKey || e.altKey || (/INPUT|TEXTAREA|SELECT/.test(tag) && e.target.type !== 'range')) return;
+    if (e.key === 'z') { setDelay(delay - 0.1); toast('Subtitle delay ' + fmtDelay(delay)); }
+    else if (e.key === 'x') { setDelay(delay + 0.1); toast('Subtitle delay ' + fmtDelay(delay)); }
   });
-  var flashTimer;
-  function flash(t) { show(t); clearTimeout(flashTimer); flashTimer = setTimeout(function () { if (media.currentTime > 0) hide(); }, 1200); }
+  ['mousemove', 'touchstart', 'keydown', 'pointerdown'].forEach(function (n) { document.addEventListener(n, function () { lastActivity = Date.now(); }, { passive: true }); });
 
-  // fade the Subtitles button with the controls
-  var idleTimer;
-  function wake() { ui.classList.remove('idle'); clearTimeout(idleTimer); idleTimer = setTimeout(function () { ui.classList.add('idle'); }, 3000); }
-  ['mousemove', 'touchstart', 'keydown'].forEach(function (n) { document.addEventListener(n, wake, { passive: true }); });
-  wake();
-
-  // keep the overlay visible in fullscreen when the fullscreen element can host it
-  function reparent() {
-    var fe = document.fullscreenElement || document.webkitFullscreenElement, host = document.body;
-    if (fe && fe.nodeType === 1 && (!fe.shadowRoot || fe.shadowRoot.querySelector('slot'))) host = fe;
-    if (ui.parentNode !== host) host.appendChild(ui);
+  // ================================================================ playback
+  function tuneEngine() {
+    // hls.js keeps ALL played video in memory by default (backBufferLength = Infinity). Keep a short window instead.
+    var tries = 0, iv = setInterval(function () {
+      var eng = media.engine;
+      if (eng && eng.config) {
+        var c = eng.config;
+        c.backBufferLength = 30; c.maxBufferLength = 30; c.maxMaxBufferLength = 60; c.maxBufferSize = 48 * 1000 * 1000;
+        c.startPosition = 0;                          // the playlist grows while ffmpeg works; do not jump to the "live" end
+        clearInterval(iv);
+      } else if (++tries > 60) clearInterval(iv);
+    }, 100);
   }
-  document.addEventListener('fullscreenchange', reparent);
-  document.addEventListener('webkitfullscreenchange', reparent);
-
-  // ------------------------------------------------------------ playback
   function begin() {
     customElements.whenDefined('hlsjs-video').then(function () {
       var url = 'index.m3u8';
-      // The playlist grows while ffmpeg works (EVENT type), so hls.js would treat it as live and
-      // jump to the end. Start at 0 like a normal episode.
-      try { media.source = { src: url, type: 'application/vnd.apple.mpegurl', engine: { hlsJs: { startPosition: 0 } } }; }
-      catch (e) { media.src = url; }
+      try { media.source = { src: url, type: 'application/vnd.apple.mpegurl' }; } catch (e) { media.src = url; }
       if (!media.src) media.src = url;
+      tuneEngine();
+      // if hls.js still started near the live edge, go back to the start once
+      var fixed = false;
+      media.addEventListener('loadedmetadata', function () { if (!fixed && media.currentTime > 3) { fixed = true; media.currentTime = 0; } });
     });
   }
   function waitForPlaylist() {
@@ -332,11 +578,9 @@ __TRACKS__
       if (txt.indexOf('#EXTINF') < 0) throw new Error('empty');
       begin();
     }).catch(function () {
-      fetch('/status', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
-        if (s.state === 'failed' || (s.exited && s.code !== 0)) {
-          show('ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.');
-          return;
-        }
+      fetch('/status?sid=' + encodeURIComponent(sid), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
+        if (s.stale) { show('This session ended.'); return; }
+        if (s.state === 'failed' || (s.exited && s.code !== 0)) { show('ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.'); return; }
         show('Starting transcode...');
         setTimeout(waitForPlaylist, 1500);
       }).catch(function () { setTimeout(waitForPlaylist, 1500); });
@@ -344,19 +588,27 @@ __TRACKS__
   }
   media.addEventListener('playing', hide);
   media.addEventListener('canplay', hide);
-  media.addEventListener('error', function () {
-    var e = media.error;
-    show(e && e.message ? 'Player error: ' + e.message : 'Unable to play this stream.');
-  });
-  waitForPlaylist();
+  media.addEventListener('error', function () { var e = media.error; show(e && e.message ? 'Player error: ' + e.message : 'Unable to play this stream.'); });
 
-  // Bridge mode: report position/pause state so IINA (and Seanime's progress tracking) follows this player.
+  // bridge mode: if IINA moved on to another episode, follow it
+  setInterval(function () {
+    fetch('/status?sid=' + encodeURIComponent(sid), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
+      if (s.stale && key) location.href = '/watch?key=' + encodeURIComponent(key);
+    }).catch(function () {});
+  }, 8000);
+
+  // bridge mode: report position/pause state so IINA (and Seanime's progress tracking) follows this player
   if (key) setInterval(function () {
     var time = media.currentTime;
     if ((!time || !isFinite(time)) && media.paused) return;
     fetch('/sync?key=' + encodeURIComponent(key) + '&sid=' + encodeURIComponent(sid) +
       '&t=' + (isFinite(time) ? time : 0).toFixed(1) + '&p=' + (media.paused ? 1 : 0), { cache: 'no-store' }).catch(function () {});
   }, 5000);
+
+  window.__ut = { style: style, cueCss: cueCss, fmt: fmt, activeAt: activeAt, hexRgba: hexRgba, edgeShadow: edgeShadow,
+                  state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached }; } };
+  requestAnimationFrame(frame);
+  waitForPlaylist();
 })();
 </script>
 </body>
@@ -487,32 +739,46 @@ def parse_ts(s):
     return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000.0
 
 
-def read_cues(path, finished):
-    """Cues of a (possibly still growing) WebVTT file. While ffmpeg is running a trailing, unfinished block is ignored."""
+def read_cues_from(path, off, finished, limit=262144):
+    """Read the cues that start at byte offset \`off\` of a (possibly still growing) WebVTT file.
+    Returns (cues, new_offset). New offsets always point at the start of an unread block, so the caller can just keep
+    asking from where it stopped; nothing is kept on the server between calls."""
     try:
-        txt = open(path, encoding="utf-8", errors="replace").read().replace("\\r\\n", "\\n")
+        with open(path, "rb") as f:
+            f.seek(off)
+            raw = f.read(limit)
     except OSError:
-        return []
-    blocks = txt.split("\\n\\n")
-    # ffmpeg flushes whole cues, and the muxer only puts the blank separator in front of the NEXT cue, so a file
-    # that ends in a newline holds only complete cues. A file cut off mid-line has an unfinished last block.
-    if not finished and blocks and not txt.endswith("\\n"):
-        blocks = blocks[:-1]
-    cues = []
-    for block in blocks:
-        lines = block.split("\\n")
+        return [], off
+    n, pos, cues = len(raw), 0, []
+    at_eof = n < limit
+    while pos < n:
+        while pos < n and raw[pos:pos + 1] == b"\\n":          # blank separator lines
+            pos += 1
+        if pos >= n:
+            break
+        end = raw.find(b"\\n\\n", pos)
+        if end == -1:
+            # last block. ffmpeg flushes whole cues and puts the blank line in front of the NEXT cue, so a block that ends
+            # in a newline (and was read up to the end of the file) is complete.
+            if not (finished or (at_eof and raw.endswith(b"\\n"))):
+                break
+            block, nxt = raw[pos:], n
+        else:
+            block, nxt = raw[pos:end], end + 2
+        lines = block.decode("utf-8", "replace").split("\\n")
         for i, line in enumerate(lines):
             if "-->" in line:
-                a, _, rest = line.partition("-->")
+                a_, _, rest = line.partition("-->")
                 try:
-                    start, end = parse_ts(a), parse_ts(rest.strip().split()[0])
+                    start, stop = parse_ts(a_), parse_ts(rest.strip().split()[0])
                 except (ValueError, IndexError):
                     break
                 text = "\\n".join(lines[i + 1:]).strip("\\n")
                 if text:
-                    cues.append([round(start, 3), round(end, 3), text])
+                    cues.append([round(start, 3), round(stop, 3), text])
                 break
-    return cues
+        pos = nxt
+    return cues, off + pos
 
 
 # ---------------------------------------------------------------- sessions
@@ -528,23 +794,41 @@ def stop_current():
         shutil.rmtree(current["dir"], ignore_errors=True)
     ev = current.get("ready")
     current.update(proc=None, dir=None, id=None, ready=None, state="idle", tracks=[], skipped=[], default=None,
-                   probe_error="")
+                   probe_error="", src=None)
     if ev:
         ev.set()                       # release anyone still waiting for the old session's player page
+
+
+def memory_profile(mode):
+    """(decoder threads, encoder threads, extra x264 params). ffmpeg's automatic thread count is 1.5 x CPU cores for x264,
+    and every extra frame thread keeps whole 1080p frames in flight, so RAM grows with the core count."""
+    cores = os.cpu_count() or 2
+    if mode == "low":
+        return 2, 2, "rc-lookahead=5:ref=1:sync-lookahead=0"
+    if mode == "full":
+        return 0, 0, ""
+    return min(4, cores), min(4, cores), ""
 
 
 def build_command(src, d, o, tracks):
     height = int(o["height"]) if o["height"].isdigit() else 1080
     audio = int(o["audio"]) if o["audio"].isdigit() else 0
     crf = o["crf"] if o["crf"].isdigit() else "18"
-    cmd = [A.ffmpeg, "-hide_banner", "-loglevel", "warning",
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-           "-i", src,
+    dec, enc, x264 = memory_profile(o.get("mem") or A.memory)
+    cmd = [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    if dec:
+        cmd += ["-threads", str(dec)]          # decoder threads (input option)
+    cmd += ["-i", src,
            # output 1: video + audio as HLS. -muxdelay/-muxpreload 0 stop the MPEG-TS muxer adding its default
            # ~1.4 s offset, so HLS timestamps stay on the same timeline as the source (= mpv/IINA's time-pos).
            "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn",
            "-vf", "scale=-2:'min(ih,%d)',format=yuv420p" % height]
     cmd += encoder_args(o["enc"], crf)
+    if enc:
+        cmd += ["-threads", str(enc)]
+    if x264 and o["enc"] not in ("h264_nvenc", "h264_qsv", "h264_videotoolbox"):
+        cmd += ["-x264-params", x264]
     cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
             "-muxdelay", "0", "-muxpreload", "0",
             "-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
@@ -577,7 +861,7 @@ def launch(sid, d, src, o, ready):
         except Exception as e:
             proc, state, probe_error = None, "failed", ("could not start ffmpeg: %s" % e)[:200]
         current.update(proc=proc, state=state, tracks=tracks, skipped=skipped, default=default,
-                       probe_error=probe_error)
+                       probe_error=probe_error, src=src, last=time.time())
     try:
         with open(os.path.join(d, "tracks.json"), "w") as f:
             json.dump({"tracks": tracks, "skipped": skipped, "default": default}, f)
@@ -593,7 +877,7 @@ def start_transcode(src, o):
         d = os.path.join(A.root, sid)
         os.makedirs(d)
         ready = threading.Event()
-        current.update(dir=d, id=sid, ready=ready, state="probing")
+        current.update(dir=d, id=sid, ready=ready, state="probing", src=src, last=time.time())
     threading.Thread(target=launch, args=(sid, d, src, o, ready), daemon=True).start()
     return sid
 
@@ -666,7 +950,8 @@ def describe(raw):
 
 
 # ---------------------------------------------------------------- IINA / mpv bridge
-bridge = {"path": None, "sid": None, "gone_since": None}
+bridge = {"path": None, "gone_since": None, "muted": False}
+bridge_lock = threading.Lock()
 
 
 def ipc(cmd, timeout=2.0):
@@ -701,29 +986,70 @@ def ipc_get(prop):
     return r.get("data") if r and r.get("error") == "success" else None
 
 
+def unmute_iina():
+    if bridge["muted"]:
+        ipc(["set_property", "mute", False])
+        bridge["muted"] = False
+
+
+def bridge_start():
+    """Start (or reuse) the transcode for whatever IINA is playing. Only called when a web viewer asks for it."""
+    with bridge_lock:
+        src = local_stream_url(bridge["path"]) if bridge["path"] else None
+        if not src:
+            return None
+        if current["id"] and current["src"] == src:
+            return current["id"]
+        sid = start_transcode(src, {"sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf,
+                                    "enc": A.encoder, "mem": A.memory})
+        if not A.keep_iina_audio:
+            ipc(["set_property", "mute", True])      # you watch in the browser, not on the Mac
+            bridge["muted"] = True
+        return sid
+
+
 def bridge_loop():
-    """Watch IINA: when it opens a Seanime stream, transcode it; when it goes away, stop."""
+    """Watch IINA. It only REMEMBERS what is playing; the transcode (CPU + RAM) starts when a web viewer asks for it,
+    follows IINA to the next episode while someone is watching, and stops when IINA goes away."""
     while True:
         try:
             path = ipc_get("path")
             if isinstance(path, str) and local_stream_url(path):
                 bridge["gone_since"] = None
                 if path != bridge["path"]:
+                    had_viewer = bool(current["id"]) and time.time() - current["last"] < 90
                     bridge["path"] = path
-                    bridge["sid"] = start_transcode(local_stream_url(path), {
-                        "sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf, "enc": A.encoder})
-                    if not A.keep_iina_audio:
-                        ipc(["set_property", "mute", True])  # you watch in the browser, not on the Mac
+                    if had_viewer:
+                        bridge_start()
+                    else:
+                        with lock:
+                            stop_current()
+                        unmute_iina()
             else:
                 if bridge["gone_since"] is None:
                     bridge["gone_since"] = time.time()
                 elif bridge["path"] and time.time() - bridge["gone_since"] > 30:
                     with lock:
                         stop_current()
-                    bridge.update(path=None, sid=None)
+                    bridge.update(path=None)
+                    bridge["muted"] = False          # the player is gone, nothing left to unmute
         except Exception as e:
             sys.stderr.write("bridge: %s\\n" % e)
         time.sleep(2)
+
+
+def idle_loop():
+    """Free the RAM: stop ffmpeg and delete its files when nobody has been watching for a while."""
+    while True:
+        time.sleep(15)
+        try:
+            if A.idle_stop > 0 and current["id"] and time.time() - current["last"] > A.idle_stop:
+                with lock:
+                    stop_current()
+                if A.iina_socket:
+                    unmute_iina()
+        except Exception as e:
+            sys.stderr.write("idle: %s\\n" % e)
 
 
 class H(http.server.SimpleHTTPRequestHandler):
@@ -752,11 +1078,20 @@ class H(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        m0 = re.match(r"/([0-9a-f]{16})/", path)
+        if m0 and m0.group(1) == current["id"]:
+            current["last"] = time.time()                  # a viewer is (still) there
         if path == "/play":
             return self.play()
         if path == "/status":
             # deliberately minimal: no session id and no log (the log can contain the stream token)
             p = current["proc"]
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            mine = q.get("sid", [""])[0]
+            if mine and mine == current["id"]:
+                current["last"] = time.time()
+            if mine and mine != current["id"]:
+                return self.reply(200, json.dumps({"version": VERSION, "stale": True}), "application/json")
             return self.reply(200, json.dumps({"version": VERSION, "state": current["state"],
                                                "exited": bool(p and p.poll() is not None),
                                                "code": p.poll() if p else None}), "application/json")
@@ -764,7 +1099,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             if not hmac.compare_digest(q.get("key", [""])[0], A.key):
                 return self.reply(403, "bad key")
-            sid = current["id"]
+            sid = bridge_start() if bridge["path"] else None
             if sid:
                 self.send_response(302)
                 self.send_header("Location", "/%s/player.html?key=%s" % (sid, urllib.parse.quote(A.key)))
@@ -776,6 +1111,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             if not hmac.compare_digest(q.get("key", [""])[0], A.key) or q.get("sid", [""])[0] != current["id"]:
                 return self.reply(403, "no")
+            current["last"] = time.time()
             try:
                 t, paused = float(q.get("t", ["0"])[0]), q.get("p", ["0"])[0] == "1"
             except ValueError:
@@ -812,7 +1148,7 @@ class H(http.server.SimpleHTTPRequestHandler):
     def serve_cues(self, sid):
         q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
         try:
-            idx, start = int(q.get("s", [""])[0]), max(0, int(q.get("from", ["0"])[0]))
+            idx, start = int(q.get("s", [""])[0]), max(0, int(q.get("off", ["0"])[0]))
         except ValueError:
             return self.reply(400, "bad args")
         track = next((t for t in current["tracks"] if t["index"] == idx), None) if current["id"] == sid else None
@@ -820,8 +1156,14 @@ class H(http.server.SimpleHTTPRequestHandler):
             return self.reply(404, "no such track")
         p = current["proc"]
         live = bool(p and p.poll() is None)
-        cues = read_cues(os.path.join(current["dir"], track["file"]), not live)
-        return self.reply(200, json.dumps({"cues": cues[start:], "total": len(cues), "live": live}), "application/json")
+        path = os.path.join(current["dir"], track["file"])
+        cues, new_off = read_cues_from(path, start, not live)
+        try:
+            eof = new_off >= os.path.getsize(path)
+        except OSError:
+            eof = True
+        return self.reply(200, json.dumps({"cues": cues, "off": new_off, "live": live, "done": (not live) and eof}),
+                          "application/json")
 
     def play(self):
         q = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -876,6 +1218,7 @@ except Exception:
 
 if A.iina_socket:
     threading.Thread(target=bridge_loop, daemon=True).start()
+threading.Thread(target=idle_loop, daemon=True).start()
 
 httpd = None
 for _ in range(10):
@@ -896,7 +1239,7 @@ except KeyboardInterrupt:
             const f: Record<string, string> = {
                 python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
                 seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
-                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current,
+                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
             try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
@@ -926,6 +1269,8 @@ except KeyboardInterrupt:
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
                     "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                    "--memory", memRef.current || "balanced",
+                    "--idle-stop", String(Math.max(0, Math.round((parseFloat(idleRef.current) || 0) * 60))),
                     ...(iinaRef.current.trim() ? ["--iina-socket", iinaRef.current.trim()] : []),
                 )
             } catch (e) {
@@ -978,6 +1323,11 @@ except KeyboardInterrupt:
                     tray.text(status.get()),
                     tray.input({ label: "Default subtitle: auto, a language code (eng), a track number, or blank for none. All tracks stay selectable in the player", fieldRef: subRef }),
                     tray.input({ label: "Audio track (0 = first)", fieldRef: audioRef }),
+                    tray.select({ label: "Memory use (ffmpeg)", fieldRef: memRef, options: [
+                        { label: "Low (about half the RAM, slightly slower)", value: "low" },
+                        { label: "Balanced", value: "balanced" },
+                        { label: "Full speed (most RAM)", value: "full" } ] }),
+                    tray.input({ label: "Stop transcoding after N idle minutes (0 = never)", fieldRef: idleRef }),
                     tray.input({ label: "Quality CRF (lower = better, 18)", fieldRef: crfRef }),
                     tray.select({ label: "Max height", fieldRef: heightRef, options: [
                         { label: "1080p", value: "1080" }, { label: "720p", value: "720" }, { label: "480p", value: "480" } ] }),
