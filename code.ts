@@ -3,7 +3,7 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v0.8 — Video.js 10 (neutral skin) web player, subtitle controls inside its Captions menu, lower RAM
+// Universal Transcode v0.9 — Video.js 10 (neutral skin) web player, subtitle controls, lower RAM, cool mode for fanless laptops
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
 // link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
 
@@ -38,6 +38,8 @@ function init() {
         const audioRef = ctx.fieldRef<string>(saved("audio", "0"))
         const iinaRef = ctx.fieldRef<string>(saved("iina", "")) // blank = bridge off; e.g. /tmp/iina_socket
         const memRef = ctx.fieldRef<string>(saved("mem", "balanced")) // ffmpeg memory profile: low | balanced | full
+        const heatRef = ctx.fieldRef<string>(saved("heat", "cool")) // cool | balanced | full
+        const bitrateRef = ctx.fieldRef<string>(saved("bitrate", "8")) // Mbps at 1080p for the hardware encoder
         const idleRef = ctx.fieldRef<string>(saved("idle", "10")) // minutes without a viewer before ffmpeg is stopped (0 = never)
 
         let server: any = null
@@ -70,6 +72,10 @@ ap.add_argument("--audio", default="0")
 ap.add_argument("--sub", default="auto", help="default subtitle: auto | none | track number | language code (eng)")
 ap.add_argument("--memory", default="balanced", choices=["low", "balanced", "full"],
                 help="ffmpeg memory profile: low (~half the RAM of full), balanced, full (auto threads, old behaviour)")
+ap.add_argument("--heat", default="cool", choices=["cool", "balanced", "full"],
+                help="cool: hardware encoder + paced transcode (fanless laptops); balanced; full: as fast as possible (hottest)")
+ap.add_argument("--bitrate", type=float, default=8.0, help="video bitrate in Mbps at 1080p for the hardware encoder")
+ap.add_argument("--keep-iina-video", action="store_true", help="bridge mode: do not switch IINA's video off while you watch in the browser")
 ap.add_argument("--idle-stop", type=int, default=600,
                 help="stop the transcode and delete its files after this many seconds with no viewer (0 = never)")
 ap.add_argument("--ffprobe", default="", help="path to ffprobe (default: next to ffmpeg, else PATH)")
@@ -79,7 +85,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -111,6 +117,13 @@ PLAYER_TEMPLATE = r'''<!doctype html>
               background: rgba(0,0,0,.7); color: #fff; font: 14px system-ui, sans-serif; pointer-events: none; opacity: 0; transition: opacity .2s; }
   #ut-toast.on { opacity: 1; }
 
+  #ut-fab { position: fixed; top: max(12px, env(safe-area-inset-top)); right: 12px; z-index: 2147483000; padding: 7px 12px; border: 0; border-radius: 6px;
+            background: rgba(0,0,0,.6); color: #fff; font: 14px system-ui, sans-serif; cursor: pointer; display: none; transition: opacity .25s; }
+  #ut-card { position: fixed; top: calc(max(12px, env(safe-area-inset-top)) + 40px); right: 12px; z-index: 2147483000; width: min(360px, calc(100vw - 24px));
+             border-radius: 8px; background: rgba(20,20,20,.95); color: #eee; display: none; }
+  #ut-card.open { display: block; }
+</style>
+<style id="ut-ctl-style">
   /* controls injected into Video.js's Captions menu (or the fallback card) */
   .ut-ctl { box-sizing: border-box; padding: 8px 12px 10px; font-size: 12px; line-height: 1.35; color: inherit; text-align: left;
             border-top: 1px solid rgba(255,255,255,.14); max-height: 52vh; overflow-y: auto; accent-color: var(--media-accent-color, #fff); }
@@ -131,11 +144,6 @@ PLAYER_TEMPLATE = r'''<!doctype html>
   .ut-ctl details { margin: 6px 0; border-top: 1px solid rgba(255,255,255,.1); padding-top: 4px; }
   .ut-ctl summary { cursor: pointer; padding: 3px 0; font-weight: 600; }
   .ut-note { margin-top: 6px; opacity: .6; font-size: 11px; }
-  #ut-fab { position: fixed; top: max(12px, env(safe-area-inset-top)); right: 12px; z-index: 2147483000; padding: 7px 12px; border: 0; border-radius: 6px;
-            background: rgba(0,0,0,.6); color: #fff; font: 14px system-ui, sans-serif; cursor: pointer; display: none; }
-  #ut-card { position: fixed; top: calc(max(12px, env(safe-area-inset-top)) + 40px); right: 12px; z-index: 2147483000; width: min(360px, calc(100vw - 24px));
-             border-radius: 8px; background: rgba(20,20,20,.95); color: #eee; display: none; }
-  #ut-card.open { display: block; }
 </style>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/video-neutral.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/media/hlsjs-video.js"></script>
@@ -377,6 +385,11 @@ __TRACKS__
     requestAnimationFrame(frame);
     if (document.hidden) return;
     ensureOverlay();
+    if (!attached && fab.style.display === 'block') {          // fallback button only: show it with the player controls
+      var showFab = controlsVisible() || card.classList.contains('open');
+      fab.style.opacity = showFab ? '1' : '0';
+      fab.style.pointerEvents = showFab ? 'auto' : 'none';
+    }
     var t = media.currentTime || 0;
     var act = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
     var sample = !act.length && Date.now() < previewUntil;
@@ -515,26 +528,71 @@ __TRACKS__
 
   // ---------------------------------------------------------------- mounting: Video.js's Captions menu, else a small fallback card
   var attached = false, fab = document.getElementById('ut-fab'), card = document.getElementById('ut-card');
+  var observed = [], mo = null;
+
+  // find an element in the page, also looking inside open shadow roots (in case the skin uses them)
+  function deepFind(sel, root) {
+    root = root || document;
+    var hit = root.querySelector ? root.querySelector(sel) : null;
+    if (hit) return hit;
+    var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var i = 0; i < els.length; i++) {
+      var sr = els[i].shadowRoot;
+      if (sr) { watchRoot(sr); var r = deepFind(sel, sr); if (r) return r; }
+    }
+    return null;
+  }
+  function watchRoot(r) {
+    if (!mo || observed.indexOf(r) >= 0) return;
+    observed.push(r); mo.observe(r, { childList: true, subtree: true });
+  }
+  function ensureStyleIn(node) {                       // our control CSS must also exist inside a shadow root
+    var rootNode = node.getRootNode ? node.getRootNode() : document;
+    if (!rootNode || rootNode === document || !rootNode.appendChild) return;
+    if (rootNode.querySelector && rootNode.querySelector('style[data-ut]')) return;
+    var st = document.getElementById('ut-ctl-style').cloneNode(true);
+    st.removeAttribute('id'); st.setAttribute('data-ut', '1'); rootNode.appendChild(st);
+  }
   function tryAttach() {
-    var g = document.querySelector('media-captions-radio-group');
+    var g = deepFind('media-captions-radio-group');
     if (!g || !g.parentNode) return false;
+    ensureStyleIn(g);
     if (ctl.previousSibling !== g || ctl.parentNode !== g.parentNode) g.parentNode.insertBefore(ctl, g.nextSibling);
-    if (!attached) { attached = true; fab.style.display = 'none'; card.classList.remove('open'); try { console.log('[universal-transcode] subtitle controls added to the Captions menu'); } catch (e) {} }
+    if (!attached) {
+      attached = true; fab.style.display = 'none'; card.classList.remove('open');
+      try { console.log('[universal-transcode] subtitle controls added to the Captions menu'); } catch (e) {}
+    }
     return true;
   }
   if (tracks.length) {
     var pending = false;
-    new MutationObserver(function () {
+    mo = new MutationObserver(function () {
       if (pending) return; pending = true;
       requestAnimationFrame(function () { pending = false; tryAttach(); });
-    }).observe(document.body, { childList: true, subtree: true });
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
     tryAttach();
     setTimeout(function () {
       if (attached) return;
-      try { console.warn('[universal-transcode] could not find the Captions menu; using the fallback button'); } catch (e) {}
-      card.appendChild(ctl); fab.style.display = 'block';
+      try { console.warn('[universal-transcode] Captions menu not found yet; showing the fallback button (it appears with the player controls). Run __ut.debug() in the console to see why.'); } catch (e) {}
+      card.appendChild(ctl); ensureStyleIn(card); fab.style.display = 'block'; fab.style.opacity = '0';
       fab.addEventListener('click', function () { card.classList.toggle('open'); });
     }, 6000);
+  }
+  // for troubleshooting: lists custom elements that look related to menus/captions and where they live
+  function debug() {
+    var tags = {}, hosts = [];
+    (function walk(root) {
+      var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+      for (var i = 0; i < els.length; i++) {
+        var n = els[i].tagName.toLowerCase();
+        if (n.indexOf('-') > 0) tags[n] = (tags[n] || 0) + 1;
+        if (els[i].shadowRoot) { hosts.push(n); walk(els[i].shadowRoot); }
+      }
+    })(document);
+    return { attached: attached, lightDom: !!document.querySelector('media-captions-radio-group'),
+             anywhere: !!deepFind('media-captions-radio-group'), shadowHosts: hosts,
+             related: Object.keys(tags).filter(function (n) { return /menu|caption|settings|popover/.test(n); }), allTags: tags };
   }
 
   // hotkeys: z / x nudge the delay by 0.1 s (same keys as mpv)
@@ -606,6 +664,7 @@ __TRACKS__
   }, 5000);
 
   window.__ut = { style: style, cueCss: cueCss, fmt: fmt, activeAt: activeAt, hexRgba: hexRgba, edgeShadow: edgeShadow,
+                  debug: debug, deepFind: deepFind,
                   state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached }; } };
   requestAnimationFrame(frame);
   waitForPlaylist();
@@ -799,6 +858,64 @@ def stop_current():
         ev.set()                       # release anyone still waiting for the old session's player page
 
 
+_caps = {}
+
+
+def ff_caps():
+    """What this ffmpeg build can do (checked once): version, hardware encoders, hardware decoders, input pacing."""
+    if _caps:
+        return _caps
+    caps = {"readrate": True, "videotoolbox_enc": False, "videotoolbox_dec": False}
+    try:
+        v = subprocess.run([A.ffmpeg, "-hide_banner", "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=10).stdout.decode("utf-8", "replace")
+        m = re.search(r"ffmpeg version n?(\\d+)\\.(\\d+)", v)
+        if m and (int(m.group(1)), int(m.group(2))) < (5, 0):
+            caps["readrate"] = False                      # -readrate arrived in ffmpeg 5.0
+        enc = subprocess.run([A.ffmpeg, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10).stdout.decode("utf-8", "replace")
+        caps["videotoolbox_enc"] = "h264_videotoolbox" in enc
+        hw = subprocess.run([A.ffmpeg, "-hide_banner", "-hwaccels"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=10).stdout.decode("utf-8", "replace")
+        caps["videotoolbox_dec"] = "videotoolbox" in hw
+    except Exception:
+        pass
+    _caps.update(caps)
+    return _caps
+
+
+def kbps_for(height, mbps_1080):
+    """Hardware encoder bitrate for the chosen output height (kbit/s)."""
+    return int(max(1000, mbps_1080 * 1000 * (min(height, 1080) / 1080.0) ** 1.2))
+
+
+def plan(o, height, caps=None, platform=None):
+    """Turn the heat/memory settings into concrete ffmpeg choices.
+    cool     = hardware encode + hardware decode (Mac) + paced reading + few threads  -> for fanless laptops
+    balanced = the encoder you picked, paced a little, hardware decode where available
+    full     = as fast as possible, automatic threads (old behaviour)"""
+    caps = caps or ff_caps()
+    platform = platform or sys.platform
+    heat = o.get("heat") or A.heat
+    mem = o.get("mem") or A.memory
+    enc = o["enc"]
+    mac = platform == "darwin"
+    if heat == "cool":
+        if mac and caps["videotoolbox_enc"] and enc in ("libx264", "h264_videotoolbox"):
+            enc = "h264_videotoolbox"
+        mem = "low"
+    p = {"enc": enc, "mem": mem, "readrate": None, "hwdecode": False, "kbps": kbps_for(height, A.bitrate)}
+    if heat == "cool":
+        p["readrate"] = 2.0
+    elif heat == "balanced":
+        p["readrate"] = 3.0
+    if heat != "full" and mac and caps["videotoolbox_dec"]:
+        p["hwdecode"] = True
+    if p["readrate"] and not caps["readrate"]:
+        p["readrate"] = None
+    return p
+
+
 def memory_profile(mode):
     """(decoder threads, encoder threads, extra x264 params). ffmpeg's automatic thread count is 1.5 x CPU cores for x264,
     and every extra frame thread keeps whole 1080p frames in flight, so RAM grows with the core count."""
@@ -814,20 +931,25 @@ def build_command(src, d, o, tracks):
     height = int(o["height"]) if o["height"].isdigit() else 1080
     audio = int(o["audio"]) if o["audio"].isdigit() else 0
     crf = o["crf"] if o["crf"].isdigit() else "18"
-    dec, enc, x264 = memory_profile(o.get("mem") or A.memory)
+    pl = plan(o, height)
+    dec, enc_threads, x264 = memory_profile(pl["mem"])
     cmd = [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-    if dec:
-        cmd += ["-threads", str(dec)]          # decoder threads (input option)
+    if pl["readrate"]:
+        cmd += ["-readrate", "%g" % pl["readrate"]]   # read the source at N x real time: smooth, lower sustained CPU load
+    if pl["hwdecode"]:
+        cmd += ["-hwaccel", "videotoolbox"]           # decode on the Mac's media engine (falls back to software by itself)
+    if dec and pl["enc"] == "libx264":
+        cmd += ["-threads", str(dec)]                 # decoder threads (input option)
     cmd += ["-i", src,
-           # output 1: video + audio as HLS. -muxdelay/-muxpreload 0 stop the MPEG-TS muxer adding its default
-           # ~1.4 s offset, so HLS timestamps stay on the same timeline as the source (= mpv/IINA's time-pos).
-           "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn",
-           "-vf", "scale=-2:'min(ih,%d)',format=yuv420p" % height]
-    cmd += encoder_args(o["enc"], crf)
-    if enc:
-        cmd += ["-threads", str(enc)]
-    if x264 and o["enc"] not in ("h264_nvenc", "h264_qsv", "h264_videotoolbox"):
+            # output 1: video + audio as HLS. -muxdelay/-muxpreload 0 stop the MPEG-TS muxer adding its default
+            # ~1.4 s offset, so HLS timestamps stay on the same timeline as the source (= mpv/IINA's time-pos).
+            "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn",
+            "-vf", "scale=-2:'min(ih,%d)',format=yuv420p" % height]
+    cmd += encoder_args(pl["enc"], crf, pl["kbps"])
+    if enc_threads and pl["enc"] == "libx264":
+        cmd += ["-threads", str(enc_threads)]
+    if x264 and pl["enc"] == "libx264":
         cmd += ["-x264-params", x264]
     cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
             "-muxdelay", "0", "-muxpreload", "0",
@@ -893,13 +1015,15 @@ def render_player():
     return PLAYER_TEMPLATE.replace("__TRACKS__", tags).replace("__CFG__", blob)
 
 
-def encoder_args(enc, crf):
+def encoder_args(enc, crf, kbps=None):
     if enc == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", crf, "-profile:v", "high", "-level", "4.1"]
     if enc == "h264_qsv":
         return ["-c:v", "h264_qsv", "-global_quality", crf, "-profile:v", "high", "-level", "4.1"]
     if enc == "h264_videotoolbox":
-        return ["-c:v", "h264_videotoolbox", "-b:v", "15M"]
+        k = kbps or 8000
+        return ["-c:v", "h264_videotoolbox", "-b:v", "%dk" % k, "-maxrate", "%dk" % int(k * 1.5), "-bufsize", "%dk" % (k * 2),
+                "-profile:v", "high"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation",
             "-profile:v", "high", "-level", "4.1"]
 
@@ -950,7 +1074,7 @@ def describe(raw):
 
 
 # ---------------------------------------------------------------- IINA / mpv bridge
-bridge = {"path": None, "gone_since": None, "muted": False}
+bridge = {"path": None, "gone_since": None, "muted": False, "vid_off": False}
 bridge_lock = threading.Lock()
 
 
@@ -990,6 +1114,9 @@ def unmute_iina():
     if bridge["muted"]:
         ipc(["set_property", "mute", False])
         bridge["muted"] = False
+    if bridge["vid_off"]:
+        ipc(["set_property", "vid", "auto"])
+        bridge["vid_off"] = False
 
 
 def bridge_start():
@@ -1001,10 +1128,15 @@ def bridge_start():
         if current["id"] and current["src"] == src:
             return current["id"]
         sid = start_transcode(src, {"sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf,
-                                    "enc": A.encoder, "mem": A.memory})
+                                    "enc": A.encoder, "mem": A.memory, "heat": A.heat})
         if not A.keep_iina_audio:
             ipc(["set_property", "mute", True])      # you watch in the browser, not on the Mac
             bridge["muted"] = True
+        if not A.keep_iina_video:
+            # IINA would otherwise keep decoding and drawing 1080p video nobody looks at (heat). Time and
+            # pause state keep working, so Seanime's progress tracking is unaffected.
+            ipc(["set_property", "vid", "no"])
+            bridge["vid_off"] = True
         return sid
 
 
@@ -1033,6 +1165,7 @@ def bridge_loop():
                         stop_current()
                     bridge.update(path=None)
                     bridge["muted"] = False          # the player is gone, nothing left to unmute
+                    bridge["vid_off"] = False
         except Exception as e:
             sys.stderr.write("bridge: %s\\n" % e)
         time.sleep(2)
@@ -1239,7 +1372,7 @@ except KeyboardInterrupt:
             const f: Record<string, string> = {
                 python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
                 seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
-                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current,
+                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current, heat: heatRef.current, bitrate: bitrateRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
             try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
@@ -1269,6 +1402,8 @@ except KeyboardInterrupt:
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
                     "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                    "--heat", heatRef.current || "cool",
+                    "--bitrate", String(parseFloat(bitrateRef.current) || 8),
                     "--memory", memRef.current || "balanced",
                     "--idle-stop", String(Math.max(0, Math.round((parseFloat(idleRef.current) || 0) * 60))),
                     ...(iinaRef.current.trim() ? ["--iina-socket", iinaRef.current.trim()] : []),
@@ -1323,6 +1458,11 @@ except KeyboardInterrupt:
                     tray.text(status.get()),
                     tray.input({ label: "Default subtitle: auto, a language code (eng), a track number, or blank for none. All tracks stay selectable in the player", fieldRef: subRef }),
                     tray.input({ label: "Audio track (0 = first)", fieldRef: audioRef }),
+                    tray.select({ label: "Heat / power", fieldRef: heatRef, options: [
+                        { label: "Cool - hardware encoder, paced (fanless Macs)", value: "cool" },
+                        { label: "Balanced - your encoder, lightly paced", value: "balanced" },
+                        { label: "Full speed - fastest, hottest", value: "full" } ] }),
+                    tray.input({ label: "Hardware encoder bitrate, Mbps at 1080p (cool mode)", fieldRef: bitrateRef }),
                     tray.select({ label: "Memory use (ffmpeg)", fieldRef: memRef, options: [
                         { label: "Low (about half the RAM, slightly slower)", value: "low" },
                         { label: "Balanced", value: "balanced" },
