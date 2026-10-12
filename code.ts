@@ -3,7 +3,7 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v0.9 — Video.js 10 (neutral skin) web player, subtitle controls, lower RAM, cool mode for fanless laptops
+// Universal Transcode v1.0 — Video.js 10 (neutral skin) web player, subtitle controls, skip opening/ending, lower RAM, cool mode
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
 // link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
 
@@ -39,6 +39,7 @@ function init() {
         const iinaRef = ctx.fieldRef<string>(saved("iina", "")) // blank = bridge off; e.g. /tmp/iina_socket
         const memRef = ctx.fieldRef<string>(saved("mem", "balanced")) // ffmpeg memory profile: low | balanced | full
         const heatRef = ctx.fieldRef<string>(saved("heat", "cool")) // cool | balanced | full
+        const skipRef = ctx.fieldRef<string>(saved("skiplookup", "on")) // look up opening/ending times online (AniList + AniSkip)
         const bitrateRef = ctx.fieldRef<string>(saved("bitrate", "8")) // Mbps at 1080p for the hardware encoder
         const idleRef = ctx.fieldRef<string>(saved("idle", "10")) // minutes without a viewer before ffmpeg is stopped (0 = never)
 
@@ -57,7 +58,7 @@ Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server w
   3. redirect the browser to a Video.js (neutral skin) player page that offers every subtitle track.
 It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
 """
-import argparse, atexit, base64, hmac, html, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.parse, urllib.request
+import argparse, atexit, base64, hmac, html, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
@@ -76,6 +77,10 @@ ap.add_argument("--heat", default="cool", choices=["cool", "balanced", "full"],
                 help="cool: hardware encoder + paced transcode (fanless laptops); balanced; full: as fast as possible (hottest)")
 ap.add_argument("--bitrate", type=float, default=8.0, help="video bitrate in Mbps at 1080p for the hardware encoder")
 ap.add_argument("--keep-iina-video", action="store_true", help="bridge mode: do not switch IINA's video off while you watch in the browser")
+ap.add_argument("--no-skip-lookup", action="store_true",
+                help="do not look up opening/ending times online (chapters inside the file are still used)")
+ap.add_argument("--anilist-url", default="https://graphql.anilist.co", help=argparse.SUPPRESS)
+ap.add_argument("--aniskip-url", default="https://api.aniskip.com/v2", help=argparse.SUPPRESS)
 ap.add_argument("--idle-stop", type=int, default=600,
                 help="stop the transcode and delete its files after this many seconds with no viewer (0 = never)")
 ap.add_argument("--ffprobe", default="", help="path to ffprobe (default: next to ffmpeg, else PATH)")
@@ -85,7 +90,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "0.9.0"
+VERSION = "1.0.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -93,7 +98,8 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(A.root)), "seanime-tra
 SHUTDOWN_TOKEN = secrets.token_hex(16)
 lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None, "ready": None, "state": "idle", "tracks": [], "skipped": [],
-           "default": None, "probe_error": "", "src": None, "last": 0.0}
+           "default": None, "probe_error": "", "src": None, "last": 0.0,
+           "skip": {"state": "pending", "segments": []}}
 
 PLAYER_TEMPLATE = r'''<!doctype html>
 <html lang="en">
@@ -113,6 +119,10 @@ PLAYER_TEMPLATE = r'''<!doctype html>
   #ut-subs .ut-box { position: absolute; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: .12em;
                      transition: bottom .18s ease; }
   #ut-subs .ut-t { white-space: pre-wrap; }
+  #ut-skip { position: absolute; right: 3%; bottom: 12%; z-index: 7; pointer-events: auto; display: none; padding: .55em 1em; border-radius: 6px;
+             border: 1px solid rgba(255,255,255,.55); background: rgba(0,0,0,.6); color: #fff; font: 600 15px system-ui, sans-serif; cursor: pointer;
+             transition: bottom .18s ease, background .15s; }
+  #ut-skip:hover { background: rgba(255,255,255,.22); }
   #ut-toast { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 6; padding: 6px 12px; border-radius: 6px;
               background: rgba(0,0,0,.7); color: #fff; font: 14px system-ui, sans-serif; pointer-events: none; opacity: 0; transition: opacity .2s; }
   #ut-toast.on { opacity: 1; }
@@ -358,8 +368,53 @@ __TRACKS__
     media.textTracks.addEventListener('addtrack', function () { setTimeout(pump, 100); });
   }
 
+  // ================================================================ skip opening / ending
+  var LABELS = { op: 'Opening', ed: 'Ending', recap: 'Recap', preview: 'Preview' };
+  var skip = { segs: [], state: 'pending' }, skipDone = {};
+  var autoSkip = { op: false, ed: false, recap: false, preview: false };
+  try { var as = JSON.parse(load('ut.autoskip', '{}')) || {}; for (var ak in autoSkip) if (as[ak] === true) autoSkip[ak] = true; } catch (e) {}
+  function segKey(s) { return s.type + '@' + s.start; }
+  function mmss(x) { x = Math.max(0, Math.round(x)); return Math.floor(x / 60) + ':' + ('0' + (x % 60)).slice(-2); }
+  function loadSkip(n) {
+    fetch('skip', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (j) {
+      skip.state = j.state; skip.segs = j.segments || [];
+      if (j.state === 'pending' && n < 60) setTimeout(function () { loadSkip(n + 1); }, 2000);
+      refreshControls();
+    }).catch(function () { if (n < 60) setTimeout(function () { loadSkip(n + 1); }, 3000); });
+  }
+  function activeSeg(t) {
+    for (var i = 0; i < skip.segs.length; i++) {
+      var s = skip.segs[i];
+      if (t >= s.start - 0.3 && t < s.end - 1) return s;
+    }
+    return null;
+  }
+  function seekableEnd() {
+    try { var r = media.seekable; return (r && r.length) ? r.end(r.length - 1) : Infinity; } catch (e) { return Infinity; }
+  }
+  function doSkip(seg) {                                // never seek past what has been transcoded so far
+    var target = Math.min(seg.end, seekableEnd() - 0.3);
+    if (!(target > (media.currentTime || 0) + 0.5)) return false;
+    media.currentTime = target;
+    toast('Skipped ' + (LABELS[seg.type] || seg.type).toLowerCase());
+    return true;
+  }
+  function updateSkipUi(t) {
+    var seg = activeSeg(t);
+    if (seg && autoSkip[seg.type] && !skipDone[segKey(seg)] && !media.paused) {
+      skipDone[segKey(seg)] = true;                     // once per segment, so rewinding into it works normally
+      if (doSkip(seg)) seg = null;
+    }
+    skipSeg = seg;
+    if (!skipEl) return;
+    if (!seg) { skipEl.style.display = 'none'; return; }
+    skipEl.textContent = 'Skip ' + (LABELS[seg.type] || seg.type) + ' \\u25B6';
+    skipEl.style.bottom = (controlsVisible() ? 17 : 10) + '%';
+    skipEl.style.display = 'block';
+  }
+
   // ================================================================ overlay renderer
-  var host = null, overlay = null, box = null, toastEl = null, lastSig = '', previewUntil = 0, lastActivity = Date.now();
+  var host = null, overlay = null, box = null, toastEl = null, skipEl = null, skipSeg = null, lastSig = '', previewUntil = 0, lastActivity = Date.now();
   function findHost() {
     return document.querySelector('media-container') || document.querySelector('video-neutral-skin') ||
            document.querySelector('video-player') || document.body;
@@ -370,10 +425,14 @@ __TRACKS__
       overlay = document.createElement('div'); overlay.id = 'ut-subs';
       box = document.createElement('div'); box.className = 'ut-box'; overlay.appendChild(box);
       toastEl = document.createElement('div'); toastEl.id = 'ut-toast';
+      skipEl = document.createElement('button'); skipEl.id = 'ut-skip'; skipEl.type = 'button';
+      // clicks on our button must not reach the player (a click on the video toggles play, a double click goes fullscreen)
+      ['click', 'dblclick', 'pointerdown', 'mousedown', 'touchstart'].forEach(function (n) { skipEl.addEventListener(n, function (e) { e.stopPropagation(); }); });
+      skipEl.addEventListener('click', function () { if (skipSeg) { skipDone[segKey(skipSeg)] = true; doSkip(skipSeg); } });
     }
     if (overlay.parentNode !== h) {
       if (h !== document.body && h.style && getComputedStyle(h).position === 'static') h.style.position = 'relative';
-      h.appendChild(overlay); h.appendChild(toastEl); host = h; lastSig = '';
+      h.appendChild(overlay); h.appendChild(toastEl); h.appendChild(skipEl); host = h; lastSig = '';
     }
   }
   function preview() { previewUntil = Date.now() + 2500; }
@@ -391,6 +450,7 @@ __TRACKS__
       fab.style.pointerEvents = showFab ? 'auto' : 'none';
     }
     var t = media.currentTime || 0;
+    updateSkipUi(t);
     var act = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
     var sample = !act.length && Date.now() < previewUntil;
     var h = overlay.clientHeight || 0;
@@ -480,6 +540,20 @@ __TRACKS__
     dr2.appendChild(el('span', '', '0 = original timing (same as mpv/IINA).')); dr2.appendChild(dv); dr2.appendChild(dz);
     updaters.push(function () { ds.value = delay; dv.textContent = fmtDelay(delay); });
 
+    // ---- skip opening / ending
+    ctl.appendChild(el('h5', '', 'Skip opening / ending'));
+    ['op', 'ed', 'recap', 'preview'].forEach(function (k) {
+      var r = row('Auto-skip ' + LABELS[k].toLowerCase(), ctl), b = el('button'); b.type = 'button';
+      b.addEventListener('click', function () { autoSkip[k] = !autoSkip[k]; save('ut.autoskip', JSON.stringify(autoSkip)); refreshControls(); });
+      r.appendChild(b); updaters.push(function () { b.textContent = autoSkip[k] ? 'On' : 'Off'; b.classList.toggle('on', !!autoSkip[k]); });
+    });
+    var sinfo = el('div', 'ut-note'); ctl.appendChild(sinfo);
+    updaters.push(function () {
+      sinfo.textContent = skip.state === 'pending' ? 'Looking for opening/ending times...' :
+        skip.segs.length ? 'Found: ' + skip.segs.map(function (s) { return (LABELS[s.type] || s.type) + ' ' + mmss(s.start) + '-' + mmss(s.end) + ' (' + (s.source === 'chapters' ? 'file chapters' : s.approx ? 'AniSkip, approximate' : 'AniSkip') + ')'; }).join(', ')
+                         : 'No opening/ending data for this file.';
+    });
+
     // ---- text
     var tx = section('Text', true);
     var fg = seg(tx, 'Font', 'font', Object.keys(FONTS).map(function (k) { return [k, FONTS[k].label]; }).concat([['custom', 'Custom']]));
@@ -520,7 +594,7 @@ __TRACKS__
     var rr = row('', pr), rb = el('button', '', 'Reset all style'); rb.type = 'button';
     rb.addEventListener('click', function () { var p = {}; for (var k in DEFAULTS) p[k] = DEFAULTS[k]; setStyle(p); setDelay(0); refreshControls(); });
     rr.appendChild(rb);
-    ctl.appendChild(el('div', 'ut-note', 'Keys: z = -0.1 s, x = +0.1 s. Settings are remembered in this browser.'));
+    ctl.appendChild(el('div', 'ut-note', 'Keys: z = -0.1 s, x = +0.1 s, s = skip opening/ending. Settings are remembered in this browser.'));
     refreshControls(); renderTrackButtons();
   })();
   // keep Video.js's menu and hotkeys from reacting to keys/clicks typed into our controls
@@ -599,6 +673,7 @@ __TRACKS__
   document.addEventListener('keydown', function (e) {
     var tag = (e.target && e.target.tagName) || '';
     if (e.ctrlKey || e.metaKey || e.altKey || (/INPUT|TEXTAREA|SELECT/.test(tag) && e.target.type !== 'range')) return;
+    if (e.key === 's' && skipSeg) { skipDone[segKey(skipSeg)] = true; doSkip(skipSeg); return; }
     if (e.key === 'z') { setDelay(delay - 0.1); toast('Subtitle delay ' + fmtDelay(delay)); }
     else if (e.key === 'x') { setDelay(delay + 0.1); toast('Subtitle delay ' + fmtDelay(delay)); }
   });
@@ -664,9 +739,10 @@ __TRACKS__
   }, 5000);
 
   window.__ut = { style: style, cueCss: cueCss, fmt: fmt, activeAt: activeAt, hexRgba: hexRgba, edgeShadow: edgeShadow,
-                  debug: debug, deepFind: deepFind,
-                  state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached }; } };
+                  debug: debug, deepFind: deepFind, activeSeg: activeSeg,
+                  state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached, autoSkip: autoSkip, skip: skip.state, segments: skip.segs.length }; } };
   requestAnimationFrame(frame);
+  loadSkip(0);
   waitForPlaylist();
 })();
 </script>
@@ -712,12 +788,22 @@ def ffprobe_path():
     return cand if cand and os.path.exists(cand) else "ffprobe"
 
 
-def probe_streams(src):
-    r = subprocess.run([ffprobe_path(), "-v", "error", "-print_format", "json", "-show_streams", "-i", src],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROBE_TIMEOUT)
+def probe_info(src):
+    """Streams, chapters and duration of the source (one ffprobe call; only reads the start of the file)."""
+    r = subprocess.run([ffprobe_path(), "-v", "error", "-print_format", "json", "-show_streams", "-show_chapters",
+                        "-show_format", "-i", src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROBE_TIMEOUT)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or b"ffprobe failed").decode("utf-8", "replace").strip()[-200:])
-    return json.loads(r.stdout.decode("utf-8", "replace")).get("streams", [])
+    j = json.loads(r.stdout.decode("utf-8", "replace"))
+    try:
+        fmt = j.get("format") or {}
+        duration = float(fmt.get("duration") or 0)
+        start = float(fmt.get("start_time") or 0)
+        if start >= 1.0 and duration > start:
+            duration -= start             # container whose timestamps start late: the episode length is what is left
+    except (TypeError, ValueError):
+        duration = 0.0
+    return {"streams": j.get("streams", []), "chapters": j.get("chapters", []), "duration": duration}
 
 
 def track_label(lang, title, forced, sdh):
@@ -840,6 +926,153 @@ def read_cues_from(path, off, finished, limit=262144):
     return cues, off + pos
 
 
+# ---------------------------------------------------------------- opening / ending ("skip intro") data
+SKIP_LABELS = {"op": "Opening", "ed": "Ending", "recap": "Recap", "preview": "Preview"}
+_CHAPTER_RULES = [("recap", re.compile(r"\\b(recap|previously|summary)\\b", re.I)),
+                  ("op", re.compile(r"\\b(op|opening|intro|introduction)\\b|\\bop ?\\d+\\b", re.I)),
+                  ("ed", re.compile(r"\\b(ed|ending|outro|credits)\\b|\\bed ?\\d+\\b", re.I)),
+                  ("preview", re.compile(r"\\b(preview|next episode|next ep|trailer)\\b", re.I))]
+
+
+def classify_chapter(title):
+    for kind, rx in _CHAPTER_RULES:
+        if rx.search(title or ""):
+            return kind
+    return None
+
+
+def chapter_segments(chapters, duration):
+    """Opening/ending/recap/preview taken from the file's own chapters (exact for this very file)."""
+    segs = []
+    for c in chapters or []:
+        title = (c.get("tags") or {}).get("title", "") or (c.get("tags") or {}).get("TITLE", "")
+        kind = classify_chapter(title)
+        try:
+            start, end = float(c["start_time"]), float(c["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if duration:
+            end = min(end, duration)
+        if kind and end - start >= 5:
+            segs.append({"type": kind, "start": round(start, 3), "end": round(end, 3), "source": "chapters", "approx": False})
+    return segs
+
+
+_SEASON_RX = re.compile(r"\\s*[:\\-]?\\s*(\\d+(st|nd|rd|th)\\s+season|season\\s*\\d+|s\\d+|part\\s*\\d+|cour\\s*\\d+|final season)\\s*$", re.I)
+
+
+def parse_filename(name):
+    """('Title', episode) from a release name such as '[Group] Title - 05 [1080p][..].mkv' (None, None if unsure)."""
+    base = urllib.parse.unquote(name.rsplit("/", 1)[-1].split("?")[0])
+    base = re.sub(r"\\.(mkv|mp4|avi|webm|m4v|ts)$", "", base, flags=re.I)
+    base = re.sub(r"\\[[^\\]]*\\]|\\([^)]*\\)|\\{[^}]*\\}", " ", base)
+    base = re.sub(r"[_.]+", " ", base)
+    base = re.sub(r"\\s+", " ", base).strip(" -")
+    m = (re.search(r"^(?P<t>.+?)\\s+-\\s+(?P<e>\\d{1,4})(?:v\\d+)?(?:\\s+-\\s+.*)?$", base) or
+         re.search(r"^(?P<t>.+?)\\s+S\\d{1,2}E(?P<e>\\d{1,4})\\b", base, re.I) or
+         re.search(r"^(?P<t>.+?)\\s+(?:EP?|Episode)\\s*(?P<e>\\d{1,4})\\b", base, re.I))
+    if not m:
+        return None, None
+    return m.group("t").strip(" -"), int(m.group("e"))
+
+
+def _http_json(url, data=None, timeout=8):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "universal-transcode/1.0",
+                                                          "Content-Type": "application/json", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def anilist_mal_id(title):
+    q = "query($s:String){Media(search:$s,type:ANIME){id idMal title{romaji english} episodes}}"
+    try:
+        j = _http_json(A.anilist_url, json.dumps({"query": q, "variables": {"s": title}}).encode())
+        return (j.get("data") or {}).get("Media") or None
+    except Exception:
+        return None
+
+
+def aniskip_segments(mal_id, episode, duration):
+    """AniSkip v2. First with the real episode length (exact matches), then without (approximate, flagged)."""
+    out = []
+    attempts = [(duration, False), (0, True)] if duration else [(0, True)]
+    for length, approx in attempts:
+        qs = "&".join("types=" + t for t in ("op", "ed", "mixed-op", "mixed-ed", "recap")) + "&episodeLength=%.3f" % (length or 0)
+        try:
+            j = _http_json("%s/skip-times/%d/%d?%s" % (A.aniskip_url, mal_id, episode, qs))
+        except urllib.error.HTTPError:
+            j = {}
+        except Exception:
+            return out
+        for r in (j.get("results") or []):
+            kind = {"op": "op", "mixed-op": "op", "ed": "ed", "mixed-ed": "ed", "recap": "recap"}.get(r.get("skipType"))
+            iv = r.get("interval") or {}
+            try:
+                start, end = float(iv["startTime"]), float(iv["endTime"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not kind or end - start < 5:
+                continue
+            if approx:
+                theirs = float(r.get("episodeLength") or 0)
+                if theirs and duration and abs(theirs - duration) > 90:     # a very different cut: the times would not line up
+                    continue
+            if any(x["type"] == kind for x in out):
+                continue
+            out.append({"type": kind, "start": round(start, 3), "end": round(min(end, duration) if duration else end, 3),
+                        "source": "aniskip", "approx": approx})
+        if out:
+            break                                              # exact matches found: do not mix in approximate ones
+    return out
+
+
+_skip_cache = {}
+
+
+def resolve_online(src, duration):
+    """Guess the show from the release file name (title + episode), find its MAL id on AniList, ask AniSkip."""
+    title, ep = parse_filename(urllib.parse.urlsplit(src).path)
+    if not title or ep is None:
+        return []
+    key = (title.lower(), ep, round(duration))
+    if key in _skip_cache:
+        return _skip_cache[key]
+    variants = [title]
+    trimmed = _SEASON_RX.sub("", title).strip()
+    if trimmed and trimmed != title:
+        variants.append(trimmed)
+    segs = []
+    for v in variants:
+        media = anilist_mal_id(v)
+        mal = (media or {}).get("idMal")
+        if not mal:
+            continue
+        total = media.get("episodes")
+        if total and ep > total:
+            continue                                            # that episode number cannot belong to this entry
+        segs = aniskip_segments(int(mal), ep, duration)
+        if segs:
+            break
+    _skip_cache[key] = segs
+    return segs
+
+
+def build_skip(info, src):
+    """Chapters win over the online database for the same kind of segment."""
+    duration = info.get("duration") or 0.0
+    segs = chapter_segments(info.get("chapters"), duration)
+    have = {s["type"] for s in segs}
+    if not A.no_skip_lookup and not ({"op", "ed"} <= have):
+        try:
+            for s in resolve_online(src, duration):
+                if s["type"] not in have:
+                    segs.append(s)
+        except Exception as e:
+            sys.stderr.write("skip lookup: %s\\n" % e)
+    segs.sort(key=lambda x: x["start"])
+    return {"state": "ready" if segs else "none", "segments": segs}
+
+
 # ---------------------------------------------------------------- sessions
 def stop_current():
     p = current["proc"]
@@ -853,7 +1086,7 @@ def stop_current():
         shutil.rmtree(current["dir"], ignore_errors=True)
     ev = current.get("ready")
     current.update(proc=None, dir=None, id=None, ready=None, state="idle", tracks=[], skipped=[], default=None,
-                   probe_error="", src=None)
+                   probe_error="", src=None, skip={"state": "pending", "segments": []})
     if ev:
         ev.set()                       # release anyone still waiting for the old session's player page
 
@@ -966,12 +1199,12 @@ def build_command(src, d, o, tracks):
 
 def launch(sid, d, src, o, ready):
     """Background worker: list the subtitle streams, then start ffmpeg with one output per track."""
-    probe_error, streams = "", []
+    probe_error, info = "", {"streams": [], "chapters": [], "duration": 0.0}
     try:
-        streams = probe_streams(src)
+        info = probe_info(src)
     except Exception as e:
         probe_error = str(e)[:200]
-    tracks, skipped = build_tracks(streams)
+    tracks, skipped = build_tracks(info["streams"])
     default = pick_default(tracks, o["sub"])
     with lock:
         if current["id"] != sid:        # a newer session replaced this one while we were probing
@@ -990,6 +1223,11 @@ def launch(sid, d, src, o, ready):
     except OSError:
         pass
     ready.set()
+    # opening/ending times can take a few seconds (network), so they are resolved after the player page is released
+    result = build_skip(info, src)
+    with lock:
+        if current["id"] == sid:
+            current["skip"] = result
 
 
 def start_transcode(src, o):
@@ -1264,8 +1502,12 @@ class H(http.server.SimpleHTTPRequestHandler):
             return
         if path == "/":
             return self.reply(200, "Universal Transcode %s is running. Use /play?key=KEY&src=STREAM_URL" % VERSION)
-        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues)", path)
+        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues|skip)", path)
         if m:
+            if m.group(2) == "skip":
+                if current["id"] != m.group(1):
+                    return self.reply(404, "no such session")
+                return self.reply(200, json.dumps(current["skip"]), "application/json")
             return self.serve_player(m.group(1)) if m.group(2) == "player.html" else self.serve_cues(m.group(1))
         return super().do_GET()
 
@@ -1372,7 +1614,7 @@ except KeyboardInterrupt:
             const f: Record<string, string> = {
                 python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
                 seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
-                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current, heat: heatRef.current, bitrate: bitrateRef.current,
+                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current, heat: heatRef.current, bitrate: bitrateRef.current, skiplookup: skipRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
             try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
@@ -1402,6 +1644,7 @@ except KeyboardInterrupt:
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
                     "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                    ...(skipRef.current === "off" ? ["--no-skip-lookup"] : []),
                     "--heat", heatRef.current || "cool",
                     "--bitrate", String(parseFloat(bitrateRef.current) || 8),
                     "--memory", memRef.current || "balanced",
@@ -1458,6 +1701,9 @@ except KeyboardInterrupt:
                     tray.text(status.get()),
                     tray.input({ label: "Default subtitle: auto, a language code (eng), a track number, or blank for none. All tracks stay selectable in the player", fieldRef: subRef }),
                     tray.input({ label: "Audio track (0 = first)", fieldRef: audioRef }),
+                    tray.select({ label: "Opening/ending times from the internet (AniList + AniSkip)", fieldRef: skipRef, options: [
+                        { label: "On (chapters in the file are always used)", value: "on" },
+                        { label: "Off (file chapters only)", value: "off" } ] }),
                     tray.select({ label: "Heat / power", fieldRef: heatRef, options: [
                         { label: "Cool - hardware encoder, paced (fanless Macs)", value: "cool" },
                         { label: "Balanced - your encoder, lightly paced", value: "balanced" },
