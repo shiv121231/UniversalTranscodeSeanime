@@ -1,12 +1,12 @@
 {
     "id": "universal-transcode",
     "name": "Universal Transcode",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "manifestURI": "https://raw.githubusercontent.com/shiv121231/UniversalTranscodeSeanime/refs/heads/main/manifest.json",
     "language": "typescript",
     "type": "plugin",
-    "description": "Transcodes torrent (and other) Seanime streams to H.264/AAC HLS and opens a Video.js 10 (neutral skin) web player with subtitle track/delay/style controls and skip opening/ending buttons. Set it as Seanime's external player link. Note this plugin has been made with the help of AI",
-    "author": "shiv121231",
+    "description": "Web player for Seanime streams: direct play, direct stream or transcode (like Jellyfin), subtitle controls, skip opening/ending, cool mode for fanless laptops. Set it as Seanime's external player link. Windows, macOS and Linux.",
+    "author": "shiv12131",
     "icon": "",
     "website": "",
     "readme": "",
@@ -39,6 +39,39 @@
                         ]
                     },
                     {
+                        "command": "python",
+                        "args": [
+                            {
+                                "validator": "^.*seanime-transcode.*server\\.py$"
+                            },
+                            {
+                                "validator": "$ARGS"
+                            }
+                        ]
+                    },
+                    {
+                        "command": "python3.exe",
+                        "args": [
+                            {
+                                "validator": "^.*seanime-transcode.*server\\.py$"
+                            },
+                            {
+                                "validator": "$ARGS"
+                            }
+                        ]
+                    },
+                    {
+                        "command": "python.exe",
+                        "args": [
+                            {
+                                "validator": "^.*seanime-transcode.*server\\.py$"
+                            },
+                            {
+                                "validator": "$ARGS"
+                            }
+                        ]
+                    },
+                    {
                         "command": "/usr/bin/python3",
                         "args": [
                             {
@@ -50,7 +83,7 @@
                         ]
                     },
                     {
-                        "command": "/opt/homebrew/bin/python3",
+                        "command": "/usr/bin/python",
                         "args": [
                             {
                                 "validator": "^.*seanime-transcode.*server\\.py$"
@@ -62,6 +95,17 @@
                     },
                     {
                         "command": "/usr/local/bin/python3",
+                        "args": [
+                            {
+                                "validator": "^.*seanime-transcode.*server\\.py$"
+                            },
+                            {
+                                "validator": "$ARGS"
+                            }
+                        ]
+                    },
+                    {
+                        "command": "/opt/homebrew/bin/python3",
                         "args": [
                             {
                                 "validator": "^.*seanime-transcode.*server\\.py$"
