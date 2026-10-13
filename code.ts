@@ -3,9 +3,10 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v1.0 — Video.js 10 (neutral skin) web player, subtitle controls, skip opening/ending, lower RAM, cool mode
+// Universal Transcode v1.1 - web player for Seanime streams (Video.js 10, neutral skin).
+// Direct play / direct stream / transcode (Jellyfin style), subtitle controls, skip opening/ending, cool mode.
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
-// link shown in this tray. Playing a torrent stream then opens the transcoded web player instead of IINA.
+// link shown in this tray. Playing a torrent stream then opens the web player instead of an external player.
 
 function init() {
     $ui.register((ctx) => {
@@ -16,22 +17,37 @@ function init() {
         const watch = ctx.state<string>("")
         const note = ctx.state<string>("")
 
-        // Persisted settings. The access key is kept in plugin storage AND in a file, so it survives reloads.
+        // Persisted settings.
         const saved = (k: string, d: string) => { try { return $storage.get<string>("ut." + k) ?? d } catch (e) { return d } }
-        const keyFile = $filepath.join($os.tempDir(), "seanime-transcode-key.txt")
-        let initialKey = saved("key", "")
-        if (!initialKey) { try { initialKey = $toString($os.readFile(keyFile)).trim() } catch (e) { } }
-        if (!initialKey) {
-            for (let i = 0; i < 24; i++) initialKey += Math.floor(Math.random() * 16).toString(16)
+
+        // ---- operating system: sets default paths and which hardware encoders the server tries
+        const detectOs = () => {
+            const p = String((($os as any).platform) || "").toLowerCase()
+            return p === "darwin" ? "mac" : p === "windows" ? "windows" : "linux"
         }
+        const OS_DEFAULTS: Record<string, { python: string, ffmpeg: string }> = {
+            mac: { python: "/usr/bin/python3", ffmpeg: "/opt/homebrew/bin/ffmpeg" },
+            linux: { python: "python3", ffmpeg: "ffmpeg" },
+            windows: { python: "python", ffmpeg: "ffmpeg" },
+        }
+        let lastOs = saved("os", detectOs())
+        const osRef = ctx.fieldRef<string>(lastOs)
+
+        // ---- access key: OPTIONAL. Empty = short link. Kept in plugin storage and in a file so it survives reloads.
+        const keyFile = $filepath.join($os.tempDir(), "seanime-transcode-key.txt")
+        let storedKey: any = null
+        try { storedKey = $storage.get<string>("ut.key") } catch (e) { }
+        let initialKey = ""
+        if (storedKey !== null && storedKey !== undefined) initialKey = String(storedKey)
+        else { try { initialKey = $toString($os.readFile(keyFile)).trim() } catch (e) { } }
         const keyRef = ctx.fieldRef<string>(initialKey)
 
-        const pythonRef = ctx.fieldRef<string>(saved("python", "/usr/bin/python3"))
-        const ffmpegRef = ctx.fieldRef<string>(saved("ffmpeg", "/opt/homebrew/bin/ffmpeg"))
+        const pythonRef = ctx.fieldRef<string>(saved("python", OS_DEFAULTS[lastOs].python))
+        const ffmpegRef = ctx.fieldRef<string>(saved("ffmpeg", OS_DEFAULTS[lastOs].ffmpeg))
         const portRef = ctx.fieldRef<string>(saved("port", "43299"))
         const publicRef = ctx.fieldRef<string>(saved("public", "")) // e.g. https://hls.example.com
         const seanimeRef = ctx.fieldRef<string>(saved("seanime", "http://127.0.0.1:43211"))
-        const encRef = ctx.fieldRef<string>(saved("enc", "libx264"))
+        const encRef = ctx.fieldRef<string>(saved("enc", "auto"))
         const heightRef = ctx.fieldRef<string>(saved("height", "1080"))
         const crfRef = ctx.fieldRef<string>(saved("crf", "18"))
         const subRef = ctx.fieldRef<string>(saved("sub", "auto")) // default subtitle: auto | none (blank) | track number | language code
@@ -41,7 +57,11 @@ function init() {
         const heatRef = ctx.fieldRef<string>(saved("heat", "cool")) // cool | balanced | full
         const skipRef = ctx.fieldRef<string>(saved("skiplookup", "on")) // look up opening/ending times online (AniList + AniSkip)
         const bitrateRef = ctx.fieldRef<string>(saved("bitrate", "8")) // Mbps at 1080p for the hardware encoder
+        const remoteBitrateRef = ctx.fieldRef<string>(saved("remotebitrate", "5")) // same, for viewers coming through a tunnel/proxy
         const idleRef = ctx.fieldRef<string>(saved("idle", "10")) // minutes without a viewer before ffmpeg is stopped (0 = never)
+        const modeRef = ctx.fieldRef<string>(saved("mode", "auto")) // transcode | auto | direct
+        const preferRef = ctx.fieldRef<string>(saved("prefer", "direct")) // direct | transcode (used by auto)
+        const startBufRef = ctx.fieldRef<string>(saved("startbuf", "10")) // seconds buffered before playback starts
 
         let server: any = null
         const root = $filepath.join($os.tempDir(), "seanime-transcode")
@@ -58,7 +78,7 @@ Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server w
   3. redirect the browser to a Video.js (neutral skin) player page that offers every subtitle track.
 It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
 """
-import argparse, atexit, base64, hmac, html, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, atexit, base64, hmac, html, http.server, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
@@ -66,7 +86,8 @@ ap.add_argument("--port", type=int, default=43299)
 ap.add_argument("--seanime", default="http://127.0.0.1:43211")
 ap.add_argument("--ffmpeg", default="ffmpeg")
 ap.add_argument("--key", default="")
-ap.add_argument("--encoder", default="libx264")
+ap.add_argument("--encoder", default="auto",
+                choices=["auto", "libx264", "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi"])
 ap.add_argument("--crf", default="18")
 ap.add_argument("--height", default="1080")
 ap.add_argument("--audio", default="0")
@@ -81,6 +102,15 @@ ap.add_argument("--no-skip-lookup", action="store_true",
                 help="do not look up opening/ending times online (chapters inside the file are still used)")
 ap.add_argument("--anilist-url", default="https://graphql.anilist.co", help=argparse.SUPPRESS)
 ap.add_argument("--aniskip-url", default="https://api.aniskip.com/v2", help=argparse.SUPPRESS)
+ap.add_argument("--platform", default="auto", choices=["auto", "mac", "windows", "linux"],
+                help="operating system the server runs on (decides which hardware encoders are tried)")
+ap.add_argument("--play-mode", default="auto", choices=["transcode", "auto", "direct"],
+                help="transcode: always transcode | auto: direct play when the browser can, else transcode | direct: direct play first")
+ap.add_argument("--prefer", default="direct", choices=["direct", "transcode"],
+                help="in auto mode, which one wins when both would work")
+ap.add_argument("--start-buffer", type=float, default=10.0, help="seconds of video to have buffered before playback starts")
+ap.add_argument("--remote-bitrate", type=float, default=5.0,
+                help="video bitrate in Mbps at 1080p for viewers coming through a tunnel/proxy (also the direct-play limit)")
 ap.add_argument("--idle-stop", type=int, default=600,
                 help="stop the transcode and delete its files after this many seconds with no viewer (0 = never)")
 ap.add_argument("--ffprobe", default="", help="path to ffprobe (default: next to ffmpeg, else PATH)")
@@ -90,7 +120,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -99,7 +129,7 @@ SHUTDOWN_TOKEN = secrets.token_hex(16)
 lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None, "ready": None, "state": "idle", "tracks": [], "skipped": [],
            "default": None, "probe_error": "", "src": None, "last": 0.0,
-           "skip": {"state": "pending", "segments": []}}
+           "skip": {"state": "pending", "segments": []}, "analysis": {}, "opts": {}, "mode": None}
 
 PLAYER_TEMPLATE = r'''<!doctype html>
 <html lang="en">
@@ -135,25 +165,28 @@ PLAYER_TEMPLATE = r'''<!doctype html>
 </style>
 <style id="ut-ctl-style">
   /* controls injected into Video.js's Captions menu (or the fallback card) */
-  .ut-ctl { box-sizing: border-box; padding: 8px 12px 10px; font-size: 12px; line-height: 1.35; color: inherit; text-align: left;
-            border-top: 1px solid rgba(255,255,255,.14); max-height: 52vh; overflow-y: auto; accent-color: var(--media-accent-color, #fff); }
+  media-captions-radio-group[data-ut-hide] { display: none !important; }       /* ours replaces it: no overlap */
+  .ut-ctl { box-sizing: border-box; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.3; color: inherit; text-align: left;
+            max-height: 36vh; overflow-y: auto; accent-color: var(--media-accent-color, #fff); }
   .ut-ctl * { box-sizing: border-box; }
-  .ut-ctl h5 { margin: 8px 0 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .65; }
+  .ut-ctl h5 { margin: 6px 0 3px; font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .65; }
   .ut-ctl h5:first-child { margin-top: 0; }
-  .ut-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; min-height: 24px; }
-  .ut-row > label { flex: 0 0 76px; opacity: .85; }
-  .ut-row input[type=range] { flex: 1; min-width: 0; margin: 0; }
-  .ut-row input[type=text] { flex: 1; min-width: 0; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: inherit; font: inherit; }
-  .ut-val { flex: 0 0 52px; text-align: right; font-variant-numeric: tabular-nums; opacity: .9; }
-  .ut-ctl button { font: inherit; color: inherit; background: rgba(255,255,255,.12); border: 0; border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+  .ut-row { display: flex; align-items: center; gap: 5px; margin: 3px 0; min-height: 22px; }
+  .ut-row > label { flex: 0 0 62px; opacity: .85; }
+  .ut-row input[type=range] { flex: 0 1 108px; width: 108px; max-width: 108px; min-width: 0; margin: 0; height: 16px; }
+  .ut-row input[type=text] { flex: 1; min-width: 0; padding: 2px 5px; border-radius: 4px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: inherit; font: inherit; }
+  .ut-val { flex: 0 0 46px; text-align: right; font-variant-numeric: tabular-nums; opacity: .9; }
+  .ut-ctl button { font: inherit; color: inherit; background: rgba(255,255,255,.12); border: 0; border-radius: 4px; padding: 2px 7px; cursor: pointer; }
   .ut-ctl button:hover { background: rgba(255,255,255,.2); }
   .ut-ctl button.on { background: var(--media-accent-color, #fff); color: var(--media-accent-text-color, #000); }
+  .ut-ctl button[disabled] { opacity: .35; cursor: default; }
   .ut-seg { display: flex; flex-wrap: wrap; gap: 3px; flex: 1; }
-  .ut-sw { width: 20px; height: 20px; padding: 0 !important; border-radius: 50% !important; border: 2px solid rgba(255,255,255,.35) !important; }
+  .ut-tracks { max-height: 66px; overflow-y: auto; }
+  .ut-sw { width: 18px; height: 18px; padding: 0 !important; border-radius: 50% !important; border: 2px solid rgba(255,255,255,.35) !important; }
   .ut-sw.on { border-color: #fff !important; outline: 2px solid var(--media-accent-color, #fff); }
-  .ut-ctl details { margin: 6px 0; border-top: 1px solid rgba(255,255,255,.1); padding-top: 4px; }
-  .ut-ctl summary { cursor: pointer; padding: 3px 0; font-weight: 600; }
-  .ut-note { margin-top: 6px; opacity: .6; font-size: 11px; }
+  .ut-ctl details { margin: 4px 0; border-top: 1px solid rgba(255,255,255,.1); padding-top: 2px; }
+  .ut-ctl summary { cursor: pointer; padding: 2px 0; font-weight: 600; }
+  .ut-note { margin-top: 4px; opacity: .6; font-size: 10.5px; }
 </style>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/video-neutral.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/media/hlsjs-video.js"></script>
@@ -161,9 +194,7 @@ PLAYER_TEMPLATE = r'''<!doctype html>
 <body>
 <video-player>
   <video-neutral-skin>
-    <hlsjs-video id="v" autoplay playsinline preload="auto" crossorigin="anonymous" stream-type="on-demand">
-__TRACKS__
-    </hlsjs-video>
+__MEDIA__
   </video-neutral-skin>
 </video-player>
 
@@ -517,10 +548,10 @@ __TRACKS__
   var P = function (n) { return n + '%'; };
 
   (function buildControls() {
-    // ---- tracks (a second way to pick a track; Video.js's own list above stays the main one)
+    // ---- tracks (this list REPLACES Video.js's own captions list while we are attached to its menu)
     if (tracks.length) {
       ctl.appendChild(el('h5', '', 'Subtitle track'));
-      var tr = el('div', 'ut-row'); var tg = el('div', 'ut-seg'); tr.appendChild(tg); ctl.appendChild(tr);
+      var tr = el('div', 'ut-row'); var tg = el('div', 'ut-seg ut-tracks'); tr.appendChild(tg); ctl.appendChild(tr);
       var off = el('button', '', 'Off'); off.type = 'button'; off.addEventListener('click', function () { setTrack(null); }); tg.appendChild(off);
       trackBtns.push(function () { off.classList.toggle('on', !selected); });
       tracks.forEach(function (t) {
@@ -528,26 +559,47 @@ __TRACKS__
         tg.appendChild(b); trackBtns.push(function () { b.classList.toggle('on', selected === t); });
       });
     }
-    // ---- timing
-    ctl.appendChild(el('h5', '', 'Subtitle timing'));
-    var dr = row('Delay', ctl), dm = el('button', '', '-0.1'), dp = el('button', '', '+0.1'), ds = el('input'), dv = el('span', 'ut-val');
-    dm.type = dp.type = 'button'; ds.type = 'range'; ds.min = -5; ds.max = 5; ds.step = 0.05;
+    // ---- timing (one compact row + value/reset)
+    ctl.appendChild(el('h5', '', 'Subtitle delay'));
+    var dr = row('', ctl), dm = el('button', '', '-0.1'), dp = el('button', '', '+0.1'), ds = el('input'), dv = el('span', 'ut-val'), dz = el('button', '', 'Reset');
+    dm.type = dp.type = dz.type = 'button'; ds.type = 'range'; ds.min = -5; ds.max = 5; ds.step = 0.05;
     dm.addEventListener('click', function () { setDelay(delay - 0.1); });
     dp.addEventListener('click', function () { setDelay(delay + 0.1); });
     ds.addEventListener('input', function () { setDelay(parseFloat(ds.value)); });
-    dr.appendChild(dm); dr.appendChild(ds); dr.appendChild(dp);
-    var dr2 = row('', ctl), dz = el('button', '', 'Reset'); dz.type = 'button'; dz.addEventListener('click', function () { setDelay(0); });
-    dr2.appendChild(el('span', '', '0 = original timing (same as mpv/IINA).')); dr2.appendChild(dv); dr2.appendChild(dz);
+    dz.addEventListener('click', function () { setDelay(0); });
+    dr.appendChild(dm); dr.appendChild(ds); dr.appendChild(dp); dr.appendChild(dv); dr.appendChild(dz);
     updaters.push(function () { ds.value = delay; dv.textContent = fmtDelay(delay); });
 
-    // ---- skip opening / ending
-    ctl.appendChild(el('h5', '', 'Skip opening / ending'));
-    ['op', 'ed', 'recap', 'preview'].forEach(function (k) {
-      var r = row('Auto-skip ' + LABELS[k].toLowerCase(), ctl), b = el('button'); b.type = 'button';
-      b.addEventListener('click', function () { autoSkip[k] = !autoSkip[k]; save('ut.autoskip', JSON.stringify(autoSkip)); refreshControls(); });
-      r.appendChild(b); updaters.push(function () { b.textContent = autoSkip[k] ? 'On' : 'Off'; b.classList.toggle('on', !!autoSkip[k]); });
+    // ---- playback method (direct play / direct stream / transcode)
+    var pb = section('Playback method', false);
+    var VIA = { direct: 'Direct play', remux: 'Direct stream', transcode: 'Transcode' };
+    var pr = row('', pb), pg = el('div', 'ut-seg'); pr.appendChild(pg); var pbtn = {};
+    var an = cfg.analysis || {}, fixed = cfg.mode === 'transcode';
+    ['direct', 'remux', 'transcode'].forEach(function (m) {
+      var b = el('button', '', VIA[m]); b.type = 'button';
+      if (fixed && m !== 'transcode' || (m === 'direct' && !an.direct_ok) || (m === 'remux' && !an.remux_ok)) b.disabled = true;
+      b.addEventListener('click', function () { if (!b.disabled && cfg.via !== m) switchTo(m); });
+      pg.appendChild(b); pbtn[m] = b;
     });
-    var sinfo = el('div', 'ut-note'); ctl.appendChild(sinfo);
+    pb.appendChild(el('div', 'ut-note', ({ direct: 'Playing the original file as it is: no transcoding, no extra load on the server.',
+      remux: 'Picture copied without re-encoding, sound converted if needed: very light on the server.',
+      transcode: 'Picture and sound re-encoded: works for everything, uses the most power.' })[cfg.via] || ''));
+    if (fixed) pb.appendChild(el('div', 'ut-note', 'The plugin is set to always transcode.'));
+    else {
+      var why = (an.reasons || []).slice(0, 3).join('; ');
+      if (why) pb.appendChild(el('div', 'ut-note', 'Why not direct: ' + why + '.'));
+    }
+    updaters.push(function () { Object.keys(pbtn).forEach(function (m) { pbtn[m].classList.toggle('on', cfg.via === m); }); });
+
+    // ---- skip opening / ending (one row of switches)
+    var sk = section('Skip opening / ending', false);
+    var sr = row('Auto-skip', sk), sg = el('div', 'ut-seg'); sr.appendChild(sg);
+    ['op', 'ed', 'recap', 'preview'].forEach(function (k) {
+      var b = el('button', '', LABELS[k]); b.type = 'button';
+      b.addEventListener('click', function () { autoSkip[k] = !autoSkip[k]; save('ut.autoskip', JSON.stringify(autoSkip)); refreshControls(); });
+      sg.appendChild(b); updaters.push(function () { b.classList.toggle('on', !!autoSkip[k]); });
+    });
+    var sinfo = el('div', 'ut-note'); sk.appendChild(sinfo);
     updaters.push(function () {
       sinfo.textContent = skip.state === 'pending' ? 'Looking for opening/ending times...' :
         skip.segs.length ? 'Found: ' + skip.segs.map(function (s) { return (LABELS[s.type] || s.type) + ' ' + mmss(s.start) + '-' + mmss(s.end) + ' (' + (s.source === 'chapters' ? 'file chapters' : s.approx ? 'AniSkip, approximate' : 'AniSkip') + ')'; }).join(', ')
@@ -555,7 +607,7 @@ __TRACKS__
     });
 
     // ---- text
-    var tx = section('Text', true);
+    var tx = section('Text', false);
     var fg = seg(tx, 'Font', 'font', Object.keys(FONTS).map(function (k) { return [k, FONTS[k].label]; }).concat([['custom', 'Custom']]));
     var cr = row('', tx), cf = el('input'); cf.type = 'text'; cf.placeholder = 'Custom font name (e.g. Helvetica Neue)';
     cf.addEventListener('change', function () { setStyle({ fontCustom: cf.value.trim(), font: cf.value.trim() ? 'custom' : style.font }); refreshControls(); });
@@ -585,16 +637,16 @@ __TRACKS__
     seg(ps, 'Align', 'align', [['left', 'Left'], ['center', 'Centre'], ['right', 'Right']]);
 
     // ---- presets
-    var pr = section('Presets', false), prow = row('', pr), pg = el('div', 'ut-seg'); prow.appendChild(pg);
+    var pr2 = section('Presets', false), prow = row('', pr2), pg2 = el('div', 'ut-seg'); prow.appendChild(pg2);
     Object.keys(PRESETS).forEach(function (n) {
       var b = el('button', '', n); b.type = 'button';
       b.addEventListener('click', function () { var p = {}; for (var k in DEFAULTS) p[k] = DEFAULTS[k]; for (var q in PRESETS[n]) p[q] = PRESETS[n][q]; setStyle(p); refreshControls(); });
-      pg.appendChild(b);
+      pg2.appendChild(b);
     });
-    var rr = row('', pr), rb = el('button', '', 'Reset all style'); rb.type = 'button';
+    var rr = row('', pr2), rb = el('button', '', 'Reset all style'); rb.type = 'button';
     rb.addEventListener('click', function () { var p = {}; for (var k in DEFAULTS) p[k] = DEFAULTS[k]; setStyle(p); setDelay(0); refreshControls(); });
     rr.appendChild(rb);
-    ctl.appendChild(el('div', 'ut-note', 'Keys: z = -0.1 s, x = +0.1 s, s = skip opening/ending. Settings are remembered in this browser.'));
+    ctl.appendChild(el('div', 'ut-note', 'Keys: z = -0.1 s, x = +0.1 s, s = skip. Settings are remembered in this browser.'));
     refreshControls(); renderTrackButtons();
   })();
   // keep Video.js's menu and hotkeys from reacting to keys/clicks typed into our controls
@@ -632,6 +684,7 @@ __TRACKS__
     if (!g || !g.parentNode) return false;
     ensureStyleIn(g);
     if (ctl.previousSibling !== g || ctl.parentNode !== g.parentNode) g.parentNode.insertBefore(ctl, g.nextSibling);
+    if (g.setAttribute && !g.getAttribute('data-ut-hide')) g.setAttribute('data-ut-hide', '1');
     if (!attached) {
       attached = true; fab.style.display = 'none'; card.classList.remove('open');
       try { console.log('[universal-transcode] subtitle controls added to the Captions menu'); } catch (e) {}
@@ -680,6 +733,58 @@ __TRACKS__
   ['mousemove', 'touchstart', 'keydown', 'pointerdown'].forEach(function (n) { document.addEventListener(n, function () { lastActivity = Date.now(); }, { passive: true }); });
 
   // ================================================================ playback
+  var VIA_ORDER = ['direct', 'remux', 'transcode'];
+  var resumeAt = parseFloat(params.get('t') || '0') || 0;
+  var startBuf = cfg.startBuffer || 10;
+  var triedFallback = false;
+
+  function switchTo(via) {                              // change pipeline and come back to the same spot
+    var pos = media.currentTime || resumeAt || 0;
+    show('Switching to ' + via + '...');
+    fetch('start?m=' + via, { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (j) {
+      var used = (j && j.mode) || via;
+      var q = new URLSearchParams(location.search);
+      q.set('m', used === 'direct' ? 'direct' : 'hls'); q.set('via', used); q.set('t', pos.toFixed(1));
+      location.replace('player.html?' + q.toString());
+    }).catch(function () { show('Could not switch playback method.'); });
+  }
+  function fallback(reason) {                           // like Jellyfin: if it cannot be played as it is, step down
+    if (triedFallback) return false;
+    var an = cfg.analysis || {}, i = VIA_ORDER.indexOf(cfg.via || (cfg.kind === 'direct' ? 'direct' : 'transcode'));
+    for (var k = i + 1; k < VIA_ORDER.length; k++) {
+      if (VIA_ORDER[k] === 'remux' && !an.remux_ok) continue;
+      triedFallback = true;
+      show(reason + ' Switching to ' + (VIA_ORDER[k] === 'remux' ? 'direct stream' : VIA_ORDER[k]) + '...');
+      switchTo(VIA_ORDER[k]);
+      return true;
+    }
+    return false;
+  }
+
+  function bufferedAhead() {
+    try {
+      var b = media.buffered, t = media.currentTime || 0;
+      for (var i = 0; i < b.length; i++) if (b.start(i) <= t + 0.6 && b.end(i) > t) return b.end(i) - t;
+    } catch (e) {}
+    return 0;
+  }
+  function seekToResume() {
+    if (!(resumeAt > 1)) return;
+    var tries = 0, iv = setInterval(function () {
+      var se = seekableEnd();
+      if (se > resumeAt + 2 || ++tries > 240) { clearInterval(iv); if (se > resumeAt + 2) media.currentTime = resumeAt; }
+    }, 250);
+  }
+  function startGate() {                                // wait for N seconds of video before playing: fewer stalls over a tunnel
+    var begun = Date.now(), iv = setInterval(function () {
+      var ahead = bufferedAhead(), dur = media.duration;
+      var all = isFinite(dur) && dur > 0 && ahead >= dur - (media.currentTime || 0) - 0.5;
+      if (ahead >= startBuf || all || Date.now() - begun > 25000) {
+        clearInterval(iv); hide();
+        try { var p = media.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+      } else show('Buffering ' + Math.floor(ahead) + ' / ' + startBuf + ' s...');
+    }, 250);
+  }
   function tuneEngine() {
     // hls.js keeps ALL played video in memory by default (backBufferLength = Infinity). Keep a short window instead.
     var tries = 0, iv = setInterval(function () {
@@ -687,7 +792,7 @@ __TRACKS__
       if (eng && eng.config) {
         var c = eng.config;
         c.backBufferLength = 30; c.maxBufferLength = 30; c.maxMaxBufferLength = 60; c.maxBufferSize = 48 * 1000 * 1000;
-        c.startPosition = 0;                          // the playlist grows while ffmpeg works; do not jump to the "live" end
+        c.startPosition = resumeAt > 1 ? resumeAt : 0;   // the playlist grows while ffmpeg works; do not jump to the "live" end
         clearInterval(iv);
       } else if (++tries > 60) clearInterval(iv);
     }, 100);
@@ -698,9 +803,10 @@ __TRACKS__
       try { media.source = { src: url, type: 'application/vnd.apple.mpegurl' }; } catch (e) { media.src = url; }
       if (!media.src) media.src = url;
       tuneEngine();
-      // if hls.js still started near the live edge, go back to the start once
-      var fixed = false;
-      media.addEventListener('loadedmetadata', function () { if (!fixed && media.currentTime > 3) { fixed = true; media.currentTime = 0; } });
+      var fixed = false;                                 // if hls.js still started near the live edge, go back once
+      media.addEventListener('loadedmetadata', function () { if (!fixed && !resumeAt && media.currentTime > 3) { fixed = true; media.currentTime = 0; } });
+      seekToResume();
+      startGate();
     });
   }
   function waitForPlaylist() {
@@ -714,36 +820,47 @@ __TRACKS__
       fetch('/status?sid=' + encodeURIComponent(sid), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
         if (s.stale) { show('This session ended.'); return; }
         if (s.state === 'failed' || (s.exited && s.code !== 0)) { show('ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.'); return; }
-        show('Starting transcode...');
+        show('Starting...');
         setTimeout(waitForPlaylist, 1500);
       }).catch(function () { setTimeout(waitForPlaylist, 1500); });
     });
   }
   media.addEventListener('playing', hide);
-  media.addEventListener('canplay', hide);
-  media.addEventListener('error', function () { var e = media.error; show(e && e.message ? 'Player error: ' + e.message : 'Unable to play this stream.'); });
+  media.addEventListener('canplay', function () { if (cfg.kind === 'direct') hide(); });
+  media.addEventListener('error', function () {
+    var e = media.error, msg = e && e.message ? 'Player error: ' + e.message : 'Unable to play this stream.';
+    if ((cfg.kind === 'direct' || cfg.via === 'remux') && fallback('This device cannot play it that way.')) return;
+    show(msg);
+  });
+  if (cfg.kind === 'direct') {
+    media.addEventListener('loadeddata', function () {   // a file whose picture the browser cannot decode plays as audio only
+      if (media.videoWidth === 0) fallback('No picture (unsupported video format).');
+      else if (resumeAt > 1) media.currentTime = resumeAt;
+    });
+    setTimeout(function () { if (!media.readyState) fallback('The file did not start loading.'); }, 15000);
+  }
 
   // bridge mode: if IINA moved on to another episode, follow it
   setInterval(function () {
     fetch('/status?sid=' + encodeURIComponent(sid), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
-      if (s.stale && key) location.href = '/watch?key=' + encodeURIComponent(key);
+      if (s.stale && cfg.bridge) location.href = '/watch' + (key ? '?key=' + encodeURIComponent(key) : '');
     }).catch(function () {});
   }, 8000);
 
   // bridge mode: report position/pause state so IINA (and Seanime's progress tracking) follows this player
-  if (key) setInterval(function () {
+  if (cfg.bridge) setInterval(function () {
     var time = media.currentTime;
     if ((!time || !isFinite(time)) && media.paused) return;
-    fetch('/sync?key=' + encodeURIComponent(key) + '&sid=' + encodeURIComponent(sid) +
+    fetch('/sync?' + (key ? 'key=' + encodeURIComponent(key) + '&' : '') + 'sid=' + encodeURIComponent(sid) +
       '&t=' + (isFinite(time) ? time : 0).toFixed(1) + '&p=' + (media.paused ? 1 : 0), { cache: 'no-store' }).catch(function () {});
   }, 5000);
 
-  window.__ut = { style: style, cueCss: cueCss, fmt: fmt, activeAt: activeAt, hexRgba: hexRgba, edgeShadow: edgeShadow,
+  window.__ut = { switchTo: switchTo, fallback: fallback, style: style, cueCss: cueCss, fmt: fmt, activeAt: activeAt, hexRgba: hexRgba, edgeShadow: edgeShadow,
                   debug: debug, deepFind: deepFind, activeSeg: activeSeg,
-                  state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached, autoSkip: autoSkip, skip: skip.state, segments: skip.segs.length }; } };
+                  state: function () { return { delay: delay, selected: selected && selected.info.label, cues: selected ? selected.list.length : 0, attached: attached, via: cfg.via, kind: cfg.kind, autoSkip: autoSkip, skip: skip.state, segments: skip.segs.length }; } };
   requestAnimationFrame(frame);
   loadSkip(0);
-  waitForPlaylist();
+  if (cfg.kind === 'direct') { show('Starting...'); } else waitForPlaylist();
 })();
 </script>
 </body>
@@ -803,7 +920,12 @@ def probe_info(src):
             duration -= start             # container whose timestamps start late: the episode length is what is left
     except (TypeError, ValueError):
         duration = 0.0
-    return {"streams": j.get("streams", []), "chapters": j.get("chapters", []), "duration": duration}
+    try:
+        bit_rate = float((j.get("format") or {}).get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        bit_rate = 0.0
+    return {"streams": j.get("streams", []), "chapters": j.get("chapters", []), "duration": duration,
+            "format_name": (j.get("format") or {}).get("format_name", ""), "bit_rate": bit_rate}
 
 
 def track_label(lang, title, forced, sdh):
@@ -1074,6 +1196,37 @@ def build_skip(info, src):
 
 
 # ---------------------------------------------------------------- sessions
+NEGOTIATE_TEMPLATE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Universal Transcode</title></head>
+<body style="margin:0;background:#000;color:#ccc;font-family:system-ui,sans-serif">
+<p id="m" style="padding:16px">Choosing the best way to play this file...</p>
+<script id="ut-cfg" type="application/json">__CFG__</script>
+<script>
+(function () {
+  var cfg = JSON.parse(document.getElementById('ut-cfg').textContent), a = cfg.analysis || {};
+  var v = document.createElement('video');
+  function can(t) { try { return v.canPlayType(t); } catch (e) { return ''; } }
+  var hasMse = !!(window.MediaSource && MediaSource.isTypeSupported && MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028,mp4a.40.2"'));
+  var canHls = hasMse || can('application/vnd.apple.mpegurl') !== '';
+  var d = a.mime ? can(a.mime + '; codecs="' + a.codecs + '"') : '';
+  var canDirect = !!a.direct_ok && d !== '';
+  var certain = d === 'probably';
+  var canRemux = !!a.remux_ok && canHls;
+  var choice;
+  if (cfg.mode === 'direct') choice = canDirect ? 'direct' : canRemux ? 'remux' : 'transcode';
+  else choice = (canDirect && (certain || cfg.prefer === 'direct')) ? 'direct' : (canRemux && cfg.prefer === 'direct') ? 'remux' : 'transcode';
+  function go(m) {
+    var q = new URLSearchParams(location.search);
+    q.set('m', m === 'direct' ? 'direct' : 'hls'); q.set('via', m);
+    location.replace('player.html?' + q.toString());
+  }
+  fetch('start?m=' + choice, { cache: 'no-store' }).then(function (r) { return r.json(); })
+    .then(function (j) { go((j && j.mode) || choice); }, function () { go(choice); });
+})();
+</script></body></html>'''
+
+
 def stop_current():
     p = current["proc"]
     if p and p.poll() is None:
@@ -1086,35 +1239,77 @@ def stop_current():
         shutil.rmtree(current["dir"], ignore_errors=True)
     ev = current.get("ready")
     current.update(proc=None, dir=None, id=None, ready=None, state="idle", tracks=[], skipped=[], default=None,
-                   probe_error="", src=None, skip={"state": "pending", "segments": []})
+                   probe_error="", src=None, skip={"state": "pending", "segments": []}, analysis={}, opts={}, mode=None)
     if ev:
         ev.set()                       # release anyone still waiting for the old session's player page
 
 
+# ---------------------------------------------------------------- platform, hardware encoders, plan
+def detect_platform():
+    if A.platform in ("mac", "windows", "linux"):
+        return A.platform
+    return {"darwin": "mac", "win32": "windows"}.get(sys.platform, "linux")
+
+
+PLATFORM = detect_platform()
+HW_ORDER = {"mac": ["h264_videotoolbox"], "windows": ["h264_nvenc", "h264_qsv", "h264_amf"],
+            "linux": ["h264_nvenc", "h264_vaapi", "h264_qsv"]}
+VAAPI_DEVICE = "/dev/dri/renderD128"
+SUBS_READRATE = 4.0                    # subtitle-only extraction (direct play) reads the file this fast, CPU use is tiny
 _caps = {}
+_hw = {}
+_hw_lock = threading.Lock()
 
 
 def ff_caps():
-    """What this ffmpeg build can do (checked once): version, hardware encoders, hardware decoders, input pacing."""
+    """What this ffmpeg build can do (checked once): input pacing, initial burst, hardware decoders."""
     if _caps:
         return _caps
-    caps = {"readrate": True, "videotoolbox_enc": False, "videotoolbox_dec": False}
+    caps = {"readrate": True, "burst": False, "hwaccels": set()}
     try:
         v = subprocess.run([A.ffmpeg, "-hide_banner", "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                            timeout=10).stdout.decode("utf-8", "replace")
         m = re.search(r"ffmpeg version n?(\\d+)\\.(\\d+)", v)
         if m and (int(m.group(1)), int(m.group(2))) < (5, 0):
             caps["readrate"] = False                      # -readrate arrived in ffmpeg 5.0
-        enc = subprocess.run([A.ffmpeg, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             timeout=10).stdout.decode("utf-8", "replace")
-        caps["videotoolbox_enc"] = "h264_videotoolbox" in enc
+        full = subprocess.run([A.ffmpeg, "-hide_banner", "-h", "full"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=20).stdout.decode("utf-8", "replace")
+        caps["burst"] = "readrate_initial_burst" in full  # ffmpeg 7.0+: read the first N seconds at full speed
         hw = subprocess.run([A.ffmpeg, "-hide_banner", "-hwaccels"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             timeout=10).stdout.decode("utf-8", "replace")
-        caps["videotoolbox_dec"] = "videotoolbox" in hw
+        caps["hwaccels"] = set(x.strip() for x in hw.splitlines()[1:] if x.strip())
     except Exception:
         pass
     _caps.update(caps)
     return _caps
+
+
+def _test_encoder(enc):
+    """Really encode a few frames with this encoder: the only reliable way to know the GPU/driver is there."""
+    args = [A.ffmpeg, "-hide_banner", "-loglevel", "error"]
+    vf = "format=yuv420p"
+    if enc == "h264_vaapi":
+        args += ["-vaapi_device", VAAPI_DEVICE]
+        vf = "format=nv12,hwupload"
+    args += ["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10", "-frames:v", "10", "-vf", vf, "-c:v", enc, "-f", "null", "-"]
+    try:
+        return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25).returncode == 0
+    except Exception:
+        return False
+
+
+def hw_works(enc):
+    with _hw_lock:
+        if enc not in _hw:
+            _hw[enc] = _test_encoder(enc)
+        return _hw[enc]
+
+
+def best_hw(platform, hw_ok):
+    for enc in HW_ORDER.get(platform, []):
+        if hw_ok(enc):
+            return enc
+    return None
 
 
 def kbps_for(height, mbps_1080):
@@ -1122,28 +1317,38 @@ def kbps_for(height, mbps_1080):
     return int(max(1000, mbps_1080 * 1000 * (min(height, 1080) / 1080.0) ** 1.2))
 
 
-def plan(o, height, caps=None, platform=None):
-    """Turn the heat/memory settings into concrete ffmpeg choices.
-    cool     = hardware encode + hardware decode (Mac) + paced reading + few threads  -> for fanless laptops
-    balanced = the encoder you picked, paced a little, hardware decode where available
-    full     = as fast as possible, automatic threads (old behaviour)"""
+def plan(o, height, caps=None, platform=None, hw_ok=None):
+    """Turn the heat/memory/encoder settings into concrete ffmpeg choices.
+    cool     = hardware encode (+ hardware decode where available) + paced reading + few threads  -> fanless laptops
+    balanced = hardware if the encoder is on auto, lightly paced
+    full     = software x264 as fast as possible, automatic threads (old behaviour)"""
     caps = caps or ff_caps()
-    platform = platform or sys.platform
+    platform = platform or PLATFORM
+    hw_ok = hw_ok or hw_works
     heat = o.get("heat") or A.heat
     mem = o.get("mem") or A.memory
-    enc = o["enc"]
-    mac = platform == "darwin"
+    choice = o.get("enc") or "auto"
+    enc = choice
+    if choice == "auto":
+        enc = (best_hw(platform, hw_ok) if heat != "full" else None) or "libx264"
+    elif choice == "libx264" and heat == "cool":
+        enc = best_hw(platform, hw_ok) or "libx264"
+    if enc != "libx264" and not hw_ok(enc):
+        enc = "libx264"                                   # asked-for hardware encoder is not available here
     if heat == "cool":
-        if mac and caps["videotoolbox_enc"] and enc in ("libx264", "h264_videotoolbox"):
-            enc = "h264_videotoolbox"
         mem = "low"
-    p = {"enc": enc, "mem": mem, "readrate": None, "hwdecode": False, "kbps": kbps_for(height, A.bitrate)}
+    remote = bool(o.get("remote"))
+    p = {"enc": enc, "mem": mem, "readrate": None, "hwdecode": None,
+         "kbps": kbps_for(height, A.remote_bitrate if remote else A.bitrate)}
     if heat == "cool":
         p["readrate"] = 2.0
     elif heat == "balanced":
         p["readrate"] = 3.0
-    if heat != "full" and mac and caps["videotoolbox_dec"]:
-        p["hwdecode"] = True
+    if heat != "full":
+        if platform == "mac" and "videotoolbox" in caps["hwaccels"]:
+            p["hwdecode"] = "videotoolbox"
+        elif platform == "windows" and "d3d11va" in caps["hwaccels"]:
+            p["hwdecode"] = "d3d11va"
     if p["readrate"] and not caps["readrate"]:
         p["readrate"] = None
     return p
@@ -1160,45 +1365,206 @@ def memory_profile(mode):
     return min(4, cores), min(4, cores), ""
 
 
-def build_command(src, d, o, tracks):
-    height = int(o["height"]) if o["height"].isdigit() else 1080
+def encoder_args(enc, crf, kbps=None):
+    k = kbps or 8000
+    rate = ["-b:v", "%dk" % k, "-maxrate", "%dk" % int(k * 1.5), "-bufsize", "%dk" % (k * 2)]
+    if enc == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr"] + rate + ["-profile:v", "high"]
+    if enc == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "medium"] + rate + ["-profile:v", "high"]
+    if enc == "h264_amf":
+        return ["-c:v", "h264_amf", "-usage", "transcoding", "-quality", "balanced"] + rate + ["-profile:v", "high"]
+    if enc == "h264_vaapi":
+        return ["-c:v", "h264_vaapi"] + rate + ["-profile:v", "high"]
+    if enc == "h264_videotoolbox":
+        return ["-c:v", "h264_videotoolbox"] + rate + ["-profile:v", "high"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation",
+            "-profile:v", "high", "-level", "4.1"]
+
+
+# ---------------------------------------------------------------- what can the browser play as-is? (Jellyfin-style analysis)
+_H264_PROFILES = {"baseline": (0x42, 0xE0), "constrained baseline": (0x42, 0xE0), "main": (0x4D, 0x40),
+                  "high": (0x64, 0x00), "extended": (0x58, 0x00)}
+_AUDIO_CODEC_STR = {"aac": "mp4a.40.2", "mp3": "mp3", "opus": "opus", "vorbis": "vorbis", "flac": "flac"}
+
+
+def analyze(info, remote):
+    """Describe the source for the player: can it be played directly, or at least without re-encoding the picture?
+    (The browser still has the last word: the page checks canPlayType and falls back by itself.)"""
+    streams = info.get("streams") or []
+    fmt = (info.get("format_name") or "").lower()
+    bps = float(info.get("bit_rate") or 0)
+    out = {"container": fmt, "mime": None, "vcodec": None, "acodec": None, "codecs": "", "bitrate": int(bps),
+           "direct_ok": False, "remux_ok": False, "audio_copy": False, "reasons": []}
+    v = next((s for s in streams if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")), None)
+    audios = [s for s in streams if s.get("codec_type") == "audio"]
+    if not v:
+        out["reasons"].append("no video stream")
+        return out
+    a = next((s for s in audios if (s.get("disposition") or {}).get("default")), audios[0] if audios else None)
+    vcodec, pix = v.get("codec_name", ""), v.get("pix_fmt", "")
+    prof = (v.get("profile") or "").lower()
+    try:
+        level = int(v.get("level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    out["vcodec"] = vcodec
+    out["acodec"] = (a or {}).get("codec_name")
+    h264_ok = vcodec == "h264" and pix in ("yuv420p", "yuvj420p") and prof in _H264_PROFILES and 0 < level <= 52
+    if vcodec != "h264":
+        out["reasons"].append("video codec %s is not H.264" % vcodec)
+    elif not h264_ok:
+        out["reasons"].append("H.264 variant browsers cannot decode (%s, %s)" % (prof or "?", pix or "?"))
+    limit = A.remote_bitrate * 1e6 * 1.25 if remote else 0
+    bitrate_ok = (not limit) or (not bps) or bps <= limit
+    if not bitrate_ok:
+        out["reasons"].append("source bitrate %.1f Mbps is above the remote limit" % (bps / 1e6))
+    audio_ok = a is None or out["acodec"] in _AUDIO_CODEC_STR
+    if not audio_ok:
+        out["reasons"].append("audio codec %s is not browser-friendly" % out["acodec"])
+    if "mp4" in fmt or "mov" in fmt:
+        out["mime"] = "video/mp4"
+    elif "matroska" in fmt or "webm" in fmt:
+        out["mime"] = "video/x-matroska"
+    else:
+        out["reasons"].append("container %s is not browser-friendly" % (fmt or "?"))
+    if h264_ok:
+        pidc, cons = _H264_PROFILES[prof]
+        vstr = "avc1.%02x%02x%02x" % (pidc, cons, level)
+        astr = _AUDIO_CODEC_STR.get(out["acodec"] or "", "")
+        out["codecs"] = vstr + ("," + astr if astr else "")
+    out["remux_ok"] = bool(h264_ok and bitrate_ok)
+    wants_other_audio = A.audio not in ("0", "") and len(audios) > 1
+    if wants_other_audio:
+        out["reasons"].append("another audio track was chosen (a browser plays the default one)")
+    out["direct_ok"] = bool(out["remux_ok"] and audio_ok and out["mime"] and not wants_other_audio)
+    ch = int((a or {}).get("channels") or 2)
+    out["audio_copy"] = bool(a and out["acodec"] in ("aac", "mp3") and ch <= 2)
+    return out
+
+
+# ---------------------------------------------------------------- ffmpeg pipelines
+def hls_output(d, burst_ok):
+    return ["-muxdelay", "0", "-muxpreload", "0",
+            "-f", "hls", "-hls_init_time", "2", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "index.m3u8")]
+
+
+def sub_outputs(d, tracks):
+    # one extra output per subtitle track: a plain WebVTT file with the ORIGINAL cue times
+    # (rebased exactly like mpv does), flushed cue by cue so it can be read while the file is still being read.
+    out = []
+    for t in tracks:
+        out += ["-map", "0:s:%d" % t["index"], "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
+                os.path.join(d, t["file"])]
+    return out
+
+
+def build_command(src, d, o, tracks, mode="transcode", analysis=None):
+    """mode: transcode = re-encode picture and sound | remux = copy the picture, fix the sound (direct stream)
+             direct = nothing but the subtitle files (the browser plays the original file through /direct)"""
+    caps = ff_caps()
+    base = [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    subs = sub_outputs(d, tracks)
+    if mode == "direct":
+        if not subs:
+            return None
+        pace = ["-readrate", "%g" % SUBS_READRATE] if caps["readrate"] else []
+        return base + pace + ["-i", src] + subs
     audio = int(o["audio"]) if o["audio"].isdigit() else 0
+    if mode == "remux":
+        analysis = analysis or {}
+        pace = ["-readrate", "3"] if caps["readrate"] else []
+        if caps["readrate"] and caps["burst"]:
+            pace += ["-readrate_initial_burst", "30"]
+        acodec = ["-c:a", "copy"] if analysis.get("audio_copy") and audio == 0 else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        return (base + pace + ["-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-c:v", "copy"] + acodec +
+                hls_output(d, True) + subs)
+    height = int(o["height"]) if o["height"].isdigit() else 1080
     crf = o["crf"] if o["crf"].isdigit() else "18"
     pl = plan(o, height)
     dec, enc_threads, x264 = memory_profile(pl["mem"])
-    cmd = [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    cmd = list(base)
     if pl["readrate"]:
         cmd += ["-readrate", "%g" % pl["readrate"]]   # read the source at N x real time: smooth, lower sustained CPU load
+        if caps["burst"]:
+            cmd += ["-readrate_initial_burst", "30"]  # ...but front-load 30 s so the viewer starts with a cushion
     if pl["hwdecode"]:
-        cmd += ["-hwaccel", "videotoolbox"]           # decode on the Mac's media engine (falls back to software by itself)
+        cmd += ["-hwaccel", pl["hwdecode"]]           # decode on the GPU/media engine (falls back to software by itself)
+    if pl["enc"] == "h264_vaapi":
+        cmd += ["-vaapi_device", VAAPI_DEVICE]
     if dec and pl["enc"] == "libx264":
         cmd += ["-threads", str(dec)]                 # decoder threads (input option)
+    scale = "scale=-2:'min(ih,%d)'" % height
+    vf = scale + (",format=nv12,hwupload" if pl["enc"] == "h264_vaapi" else ",format=yuv420p")
     cmd += ["-i", src,
             # output 1: video + audio as HLS. -muxdelay/-muxpreload 0 stop the MPEG-TS muxer adding its default
             # ~1.4 s offset, so HLS timestamps stay on the same timeline as the source (= mpv/IINA's time-pos).
-            "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn",
-            "-vf", "scale=-2:'min(ih,%d)',format=yuv420p" % height]
+            "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-vf", vf]
     cmd += encoder_args(pl["enc"], crf, pl["kbps"])
+    # HLS can only cut on keyframes and anime encodes often have one every ~10 s, which would mean 10 s segments (slow
+    # start, coarse buffering, stalls over a tunnel). A keyframe every 2 s gives clean 4 s segments after a 2 s first one.
+    cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
     if enc_threads and pl["enc"] == "libx264":
         cmd += ["-threads", str(enc_threads)]
     if x264 and pl["enc"] == "libx264":
         cmd += ["-x264-params", x264]
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
-            "-muxdelay", "0", "-muxpreload", "0",
-            "-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
-            "-hls_flags", "independent_segments",
-            "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "index.m3u8")]
-    # one extra output per subtitle track: a plain WebVTT file with the ORIGINAL cue times
-    # (rebased exactly like mpv does), flushed cue by cue so it can be read while the transcode runs.
-    for t in tracks:
-        cmd += ["-map", "0:s:%d" % t["index"], "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
-                os.path.join(d, t["file"])]
+    cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"] + hls_output(d, True) + subs
     return cmd
 
 
+def _clear_outputs(d):
+    try:
+        for f in os.listdir(d):
+            if f == "index.m3u8" or f.startswith("seg_") or f.startswith("sub_"):
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _start_mode_locked(sid, mode):
+    """(Re)start the pipeline for the running session. The caller holds \`lock\`."""
+    if current["id"] != sid:
+        return None
+    if A.play_mode == "transcode":
+        mode = "transcode"
+    if current["mode"] == mode and current["state"] in ("running", "direct"):
+        return mode
+    p = current["proc"]
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+    d = current["dir"]
+    _clear_outputs(d)
+    try:
+        cmd = build_command(current["src"], d, current["opts"], current["tracks"], mode, current["analysis"])
+        if cmd is None:
+            proc, state = None, "direct"
+        else:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(os.path.join(d, "ffmpeg.log"), "ab"))
+            state = "running"
+    except Exception as e:
+        proc, state = None, "failed"
+        current["probe_error"] = ("could not start ffmpeg: %s" % e)[:200]
+    current.update(proc=proc, mode=mode, state=state, last=time.time())
+    return mode
+
+
+def start_mode(sid, mode):
+    with lock:
+        return _start_mode_locked(sid, mode)
+
+
 def launch(sid, d, src, o, ready):
-    """Background worker: list the subtitle streams, then start ffmpeg with one output per track."""
+    """Background worker: probe the file (subtitle tracks, chapters, codecs), then start what the chosen mode needs."""
     probe_error, info = "", {"streams": [], "chapters": [], "duration": 0.0}
     try:
         info = probe_info(src)
@@ -1206,17 +1572,14 @@ def launch(sid, d, src, o, ready):
         probe_error = str(e)[:200]
     tracks, skipped = build_tracks(info["streams"])
     default = pick_default(tracks, o["sub"])
+    analysis = analyze(info, o.get("remote"))
     with lock:
         if current["id"] != sid:        # a newer session replaced this one while we were probing
             return
-        try:
-            log = open(os.path.join(d, "ffmpeg.log"), "wb")
-            proc = subprocess.Popen(build_command(src, d, o, tracks), stdout=subprocess.DEVNULL, stderr=log)
-            state = "running"
-        except Exception as e:
-            proc, state, probe_error = None, "failed", ("could not start ffmpeg: %s" % e)[:200]
-        current.update(proc=proc, state=state, tracks=tracks, skipped=skipped, default=default,
-                       probe_error=probe_error, src=src, last=time.time())
+        current.update(tracks=tracks, skipped=skipped, default=default, probe_error=probe_error, src=src, last=time.time(),
+                       analysis=analysis, opts=o, mode=None, state="ready")
+        if A.play_mode == "transcode":
+            _start_mode_locked(sid, "transcode")     # nothing to decide: start right away
     try:
         with open(os.path.join(d, "tracks.json"), "w") as f:
             json.dump({"tracks": tracks, "skipped": skipped, "default": default}, f)
@@ -1242,28 +1605,31 @@ def start_transcode(src, o):
     return sid
 
 
-def render_player():
-    """The player page, with every subtitle track declared as a <track> so the player's captions UI sees them."""
+def render_player(kind="hls", via=""):
+    """The player page, with every subtitle track declared as a <track> so the player's captions UI sees them.
+    kind: 'hls' (hlsjs-video) or 'direct' (a plain <video> playing the original file through /direct)."""
     cfg = {"tracks": current["tracks"], "skipped": current["skipped"], "default": current["default"],
-           "probe_error": current["probe_error"]}
+           "probe_error": current["probe_error"], "bridge": bool(A.iina_socket), "kind": kind, "via": via,
+           "analysis": current["analysis"], "mode": A.play_mode, "prefer": A.prefer, "startBuffer": A.start_buffer,
+           "keyRequired": bool(A.key)}
     tags = "\\n".join('      <track id="%s" kind="subtitles" label="%s" srclang="%s">' % (
         html.escape(t["id"], True), html.escape(t["label"], True), html.escape(t["lang"], True))
         for t in current["tracks"])
+    if kind == "direct":
+        media = ('    <video id="v" src="direct" autoplay playsinline preload="auto" crossorigin="anonymous">\\n' + tags +
+                 "\\n    </video>")
+    else:
+        media = ('    <hlsjs-video id="v" playsinline preload="auto" crossorigin="anonymous" stream-type="on-demand">\\n' + tags +
+                 "\\n    </hlsjs-video>")
     blob = json.dumps(cfg).replace("</", "<\\\\/").replace("<!--", "<\\\\!--")
-    return PLAYER_TEMPLATE.replace("__TRACKS__", tags).replace("__CFG__", blob)
+    return PLAYER_TEMPLATE.replace("__MEDIA__", media).replace("__CFG__", blob)
 
 
-def encoder_args(enc, crf, kbps=None):
-    if enc == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", crf, "-profile:v", "high", "-level", "4.1"]
-    if enc == "h264_qsv":
-        return ["-c:v", "h264_qsv", "-global_quality", crf, "-profile:v", "high", "-level", "4.1"]
-    if enc == "h264_videotoolbox":
-        k = kbps or 8000
-        return ["-c:v", "h264_videotoolbox", "-b:v", "%dk" % k, "-maxrate", "%dk" % int(k * 1.5), "-bufsize", "%dk" % (k * 2),
-                "-profile:v", "high"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-tune", "animation",
-            "-profile:v", "high", "-level", "4.1"]
+def render_negotiation():
+    """A tiny page that asks the browser what it can play, starts the matching pipeline and loads the real player."""
+    cfg = {"analysis": current["analysis"], "mode": A.play_mode, "prefer": A.prefer}
+    blob = json.dumps(cfg).replace("</", "<\\\\/").replace("<!--", "<\\\\!--")
+    return NEGOTIATE_TEMPLATE.replace("__CFG__", blob)
 
 
 def normalize_src(raw):
@@ -1316,8 +1682,44 @@ bridge = {"path": None, "gone_since": None, "muted": False, "vid_off": False}
 bridge_lock = threading.Lock()
 
 
+def _ipc_pipe(cmd, timeout):
+    """mpv's Windows IPC is a named pipe (\\\\\\\\.\\\\pipe\\\\name). A plain file object talks to it; the blocking read runs in a
+    thread so a silent pipe cannot hang the bridge. (Not testable on Linux/macOS: marked experimental in the README.)"""
+    out = {}
+
+    def work():
+        try:
+            with open(A.iina_socket, "r+b", buffering=0) as f:
+                f.write((json.dumps({"command": cmd, "request_id": 4242}) + "\\n").encode())
+                buf = b""
+                while True:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    for line in buf.split(b"\\n"):
+                        try:
+                            j = json.loads(line)
+                        except Exception:
+                            continue
+                        if j.get("request_id") == 4242:
+                            out["r"] = j
+                            return
+        except Exception:
+            pass
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    return out.get("r")
+
+
 def ipc(cmd, timeout=2.0):
     """One-shot mpv JSON IPC request. Returns the parsed reply or None."""
+    if A.iina_socket.startswith("\\\\\\\\.\\\\pipe\\\\") or A.iina_socket.startswith("//./pipe/"):
+        return _ipc_pipe(cmd, timeout)
+    if not hasattr(socket, "AF_UNIX"):
+        return None
     try:
         sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sk.settimeout(timeout)
@@ -1357,16 +1759,20 @@ def unmute_iina():
         bridge["vid_off"] = False
 
 
-def bridge_start():
-    """Start (or reuse) the transcode for whatever IINA is playing. Only called when a web viewer asks for it."""
+def session_opts(remote=False):
+    return {"sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf, "enc": A.encoder,
+            "mem": A.memory, "heat": A.heat, "remote": bool(remote)}
+
+
+def bridge_start(remote=False):
+    """Start (or reuse) the session for whatever IINA is playing. Only called when a web viewer asks for it."""
     with bridge_lock:
         src = local_stream_url(bridge["path"]) if bridge["path"] else None
         if not src:
             return None
         if current["id"] and current["src"] == src:
             return current["id"]
-        sid = start_transcode(src, {"sub": A.sub, "audio": A.audio, "height": A.height, "crf": A.crf,
-                                    "enc": A.encoder, "mem": A.memory, "heat": A.heat})
+        sid = start_transcode(src, session_opts(remote))
         if not A.keep_iina_audio:
             ipc(["set_property", "mute", True])      # you watch in the browser, not on the Mac
             bridge["muted"] = True
@@ -1390,7 +1796,7 @@ def bridge_loop():
                     had_viewer = bool(current["id"]) and time.time() - current["last"] < 90
                     bridge["path"] = path
                     if had_viewer:
-                        bridge_start()
+                        bridge_start(bool(current["opts"].get("remote")))
                     else:
                         with lock:
                             stop_current()
@@ -1423,6 +1829,9 @@ def idle_loop():
             sys.stderr.write("idle: %s\\n" % e)
 
 
+_last_play = [0.0]
+
+
 class H(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
                       ".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t", ".vtt": "text/vtt"}
@@ -1438,6 +1847,26 @@ class H(http.server.SimpleHTTPRequestHandler):
     def list_directory(self, path):
         self.send_error(404)
         return None
+
+    def is_remote(self):
+        """True when the request comes through a tunnel/proxy (they add forwarding headers) or from outside the LAN."""
+        h = self.headers
+        if h.get("CF-Connecting-IP") or h.get("X-Forwarded-For") or h.get("Forwarded") or h.get("X-Real-IP"):
+            return True
+        try:
+            ip = ipaddress.ip_address(self.client_address[0].split("%")[0])
+            if getattr(ip, "ipv4_mapped", None):
+                ip = ip.ipv4_mapped
+            return not (ip.is_private or ip.is_loopback or ip.is_link_local)
+        except ValueError:
+            return False
+
+    def key_ok(self, given, bridge=False):
+        """The access key is optional. With a key it must match. Without one everything works on your own network, and
+        the IINA bridge pages are never served to requests that come in from the internet."""
+        if A.key:
+            return hmac.compare_digest(given or "", A.key)
+        return not (bridge and self.is_remote())
 
     def reply(self, code, body, ctype="text/plain"):
         b = body.encode()
@@ -1463,24 +1892,24 @@ class H(http.server.SimpleHTTPRequestHandler):
                 current["last"] = time.time()
             if mine and mine != current["id"]:
                 return self.reply(200, json.dumps({"version": VERSION, "stale": True}), "application/json")
-            return self.reply(200, json.dumps({"version": VERSION, "state": current["state"],
+            return self.reply(200, json.dumps({"version": VERSION, "state": current["state"], "mode": current["mode"],
                                                "exited": bool(p and p.poll() is not None),
                                                "code": p.poll() if p else None}), "application/json")
         if path == "/watch" and A.iina_socket:
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            if not hmac.compare_digest(q.get("key", [""])[0], A.key):
-                return self.reply(403, "bad key")
-            sid = bridge_start() if bridge["path"] else None
+            if not self.key_ok(q.get("key", [""])[0], True):
+                return self.reply(403, "bad key (the IINA bridge needs an access key when it is opened from the internet)")
+            sid = bridge_start(self.is_remote()) if bridge["path"] else None
             if sid:
                 self.send_response(302)
-                self.send_header("Location", "/%s/player.html?key=%s" % (sid, urllib.parse.quote(A.key)))
+                self.send_header("Location", "/%s/player.html%s" % (sid, ("?key=" + urllib.parse.quote(A.key)) if A.key else ""))
                 return self.end_headers()
             return self.reply(200, "<meta http-equiv='refresh' content='3'><body style='background:#000;color:#ccc;"
                                    "font-family:sans-serif'><p style='padding:12px'>Waiting for IINA to start a Seanime "
                                    "stream... (this page refreshes by itself)</p>", "text/html")
         if path == "/sync" and A.iina_socket:
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            if not hmac.compare_digest(q.get("key", [""])[0], A.key) or q.get("sid", [""])[0] != current["id"]:
+            if not self.key_ok(q.get("key", [""])[0], True) or q.get("sid", [""])[0] != current["id"]:
                 return self.reply(403, "no")
             current["last"] = time.time()
             try:
@@ -1501,15 +1930,25 @@ class H(http.server.SimpleHTTPRequestHandler):
             threading.Thread(target=lambda: (time.sleep(0.3), stop_current(), os._exit(0)), daemon=True).start()
             return
         if path == "/":
-            return self.reply(200, "Universal Transcode %s is running. Use /play?key=KEY&src=STREAM_URL" % VERSION)
-        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues|skip)", path)
+            return self.reply(200, "Universal Transcode %s is running. Use /play?src=STREAM_URL (add &key=KEY if you set an access key)" % VERSION)
+        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues|skip|start|direct)", path)
         if m:
+            if m.group(2) == "direct":
+                return self.serve_direct(m.group(1))
+            if m.group(2) == "start":
+                return self.serve_start(m.group(1))
             if m.group(2) == "skip":
                 if current["id"] != m.group(1):
                     return self.reply(404, "no such session")
                 return self.reply(200, json.dumps(current["skip"]), "application/json")
             return self.serve_player(m.group(1)) if m.group(2) == "player.html" else self.serve_cues(m.group(1))
         return super().do_GET()
+
+    def do_HEAD(self):
+        m = re.fullmatch(r"/([0-9a-f]{16})/direct", self.path.split("?", 1)[0])
+        if m:
+            return self.serve_direct(m.group(1))
+        return super().do_HEAD()
 
     def serve_player(self, sid):
         ev = current.get("ready")
@@ -1518,7 +1957,73 @@ class H(http.server.SimpleHTTPRequestHandler):
         ev.wait(PROBE_TIMEOUT + 10)      # the page is built once the subtitle tracks are known
         if current["id"] != sid:
             return self.reply(404, "no such session")
-        return self.reply(200, render_player(), "text/html")
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        kind, via = q.get("m", [""])[0], q.get("via", [""])[0]
+        if kind not in ("hls", "direct"):
+            if A.play_mode == "transcode":
+                kind, via = "hls", "transcode"
+            else:
+                return self.reply(200, render_negotiation(), "text/html")   # let the browser pick direct / remux / transcode
+        # make sure the pipeline this page needs is actually running (bookmark, reload, hand-edited URL)
+        if kind == "hls" and current["mode"] not in ("remux", "transcode"):
+            start_mode(sid, "transcode")
+        elif kind == "direct" and current["mode"] != "direct":
+            start_mode(sid, "direct")
+        return self.reply(200, render_player(kind, via or current["mode"] or ""), "text/html")
+
+    def serve_start(self, sid):
+        """The page tells us which pipeline it needs: direct (subtitles only), remux (copy picture) or transcode."""
+        if current["id"] != sid:
+            return self.reply(404, "no such session")
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        m = q.get("m", ["transcode"])[0]
+        if m not in ("direct", "remux", "transcode"):
+            return self.reply(400, "bad mode")
+        a = current["analysis"]
+        if m == "direct" and not a.get("direct_ok"):
+            m = "remux" if a.get("remux_ok") else "transcode"                 # step down: direct stream, then transcode
+        if m == "remux" and not a.get("remux_ok"):
+            m = "transcode"
+        used = start_mode(sid, m)
+        return self.reply(200, json.dumps({"mode": used, "state": current["state"]}), "application/json")
+
+    def serve_direct(self, sid):
+        """Direct play: stream the ORIGINAL file (with Range support for seeking) from the local Seanime server."""
+        if current["id"] != sid or not current["src"]:
+            return self.reply(404, "no such session")
+        current["last"] = time.time()
+        headers = {"User-Agent": "universal-transcode/%s" % VERSION}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        req = urllib.request.Request(current["src"], headers=headers, method="HEAD" if self.command == "HEAD" else "GET")
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            r = e                                                            # 206/416/4xx: pass them through unchanged
+        except Exception as e:
+            return self.reply(502, "could not reach Seanime: %s" % e)
+        try:
+            self.send_response(r.status if hasattr(r, "status") else r.code)
+            for h in ("Content-Length", "Content-Range", "Last-Modified", "ETag"):
+                if r.headers.get(h):
+                    self.send_header(h, r.headers[h])
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", current["analysis"].get("mime") or r.headers.get("Content-Type") or "application/octet-stream")
+            self.end_headers()
+            if self.command != "HEAD":
+                while True:
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    current["last"] = time.time()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass                                                             # the browser closed the connection (seek/stop)
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
 
     def serve_cues(self, sid):
         q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -1547,7 +2052,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             return self.reply(400, "missing src")
         # src must come last: it may contain its own ?token=... which would otherwise be split off
         params = {k: v[0] for k, v in urllib.parse.parse_qs(q[:i]).items()}
-        if A.key and not hmac.compare_digest(params.get("key", ""), A.key):
+        if not self.key_ok(params.get("key", "")):
             return self.reply(403, "bad key: the key in this link does not match the running server.\\n"
                                    "Open the Universal Transcode tray in Seanime, press 'Start / apply settings', "
                                    "copy the link it shows and paste it into Seanime's External player link again.")
@@ -1558,9 +2063,16 @@ class H(http.server.SimpleHTTPRequestHandler):
         src = local_stream_url(rawsrc)
         if not src:
             return self.reply(400, "src is not a Seanime stream URL (it must have a path like /api/v1/.../stream...)\\n" + describe(rawsrc))
-        o = {"sub": params.get("sub", A.sub), "audio": params.get("audio", A.audio),
-             "height": params.get("h", A.height), "crf": params.get("crf", A.crf),
-             "enc": params.get("enc", A.encoder)}
+        remote = self.is_remote()
+        if not A.key and remote and "token=" not in rawsrc.lower():
+            return self.reply(403, "without an access key, requests from the internet must carry a Seanime stream token")
+        now = time.time()
+        if now - _last_play[0] < 1.0:
+            return self.reply(429, "slow down")
+        _last_play[0] = now
+        o = session_opts(remote)
+        o.update({"sub": params.get("sub", A.sub), "audio": params.get("audio", A.audio),
+                  "height": params.get("h", A.height), "crf": params.get("crf", A.crf), "enc": params.get("enc", A.encoder)})
         sid = start_transcode(src, o)
         self.send_response(302)
         self.send_header("Location", "/%s/player.html" % sid)
@@ -1612,9 +2124,11 @@ except KeyboardInterrupt:
 
         function persist() {
             const f: Record<string, string> = {
-                python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
+                os: osRef.current, python: pythonRef.current, ffmpeg: ffmpegRef.current, port: portRef.current, public: publicRef.current,
                 seanime: seanimeRef.current, enc: encRef.current, height: heightRef.current, crf: crfRef.current,
-                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current, heat: heatRef.current, bitrate: bitrateRef.current, skiplookup: skipRef.current,
+                sub: subRef.current, audio: audioRef.current, iina: iinaRef.current, mem: memRef.current, idle: idleRef.current,
+                heat: heatRef.current, bitrate: bitrateRef.current, remotebitrate: remoteBitrateRef.current, skiplookup: skipRef.current,
+                mode: modeRef.current, prefer: preferRef.current, startbuf: startBufRef.current,
             }
             for (const k of Object.keys(f)) { try { $storage.set("ut." + k, f[k]) } catch (e) { } }
             try { $storage.set("ut.key", keyRef.current.trim()) } catch (e) { }
@@ -1625,28 +2139,39 @@ except KeyboardInterrupt:
             if (server) { try { server.getCommand().process.kill() } catch (e) { log("kill failed: " + e) } server = null }
         }
 
+        // When the operating system is changed, move any path that still holds the OLD system's default to the new default.
+        function applyOsDefaults() {
+            const now = osRef.current
+            if (now === lastOs || !OS_DEFAULTS[now]) return
+            const old = OS_DEFAULTS[lastOs] || { python: "", ffmpeg: "" }
+            if (!pythonRef.current.trim() || pythonRef.current.trim() === old.python) pythonRef.setValue(OS_DEFAULTS[now].python)
+            if (!ffmpegRef.current.trim() || ffmpegRef.current.trim() === old.ffmpeg) ffmpegRef.setValue(OS_DEFAULTS[now].ffmpeg)
+            if (now !== "mac" && iinaRef.current.trim() === "/tmp/iina_socket") iinaRef.setValue("")
+            lastOs = now
+        }
+
         function start() {
-            // never run without a key (an empty key would leave /play open to anyone who can reach it)
-            if (!keyRef.current.trim()) {
-                let k = ""
-                for (let i = 0; i < 24; i++) k += Math.floor(Math.random() * 16).toString(16)
-                keyRef.setValue(k)
-            }
+            applyOsDefaults()
             persist()
             stop()
+            const key = keyRef.current.trim()
             try {
                 $os.mkdirAll(root, 0o755)
                 const script = $filepath.join(root, "server.py")
                 $os.writeFile(script, $toBytes(SERVER_PY), 0o644)
                 server = $osExtra.asyncCmd(
-                    pythonRef.current.trim() || "python3", script,
-                    "--root", root, "--port", portRef.current.trim(),
+                    pythonRef.current.trim() || (osRef.current === "windows" ? "python" : "python3"), script,
+                    "--root", root, "--port", portRef.current.trim(), "--platform", osRef.current,
                     "--seanime", seanimeRef.current.trim(), "--ffmpeg", ffmpegRef.current.trim() || "ffmpeg",
-                    "--key", keyRef.current.trim(), "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
+                    ...(key ? ["--key", key] : []),
+                    "--encoder", encRef.current, "--crf", crfRef.current.trim() || "18",
                     "--height", heightRef.current, "--audio", audioRef.current.trim() || "0", "--sub", subRef.current.trim() || "none",
+                    "--play-mode", modeRef.current || "auto", "--prefer", preferRef.current || "direct",
+                    "--start-buffer", String(Math.max(0, parseFloat(startBufRef.current) || 10)),
                     ...(skipRef.current === "off" ? ["--no-skip-lookup"] : []),
                     "--heat", heatRef.current || "cool",
                     "--bitrate", String(parseFloat(bitrateRef.current) || 8),
+                    "--remote-bitrate", String(parseFloat(remoteBitrateRef.current) || 5),
                     "--memory", memRef.current || "balanced",
                     "--idle-stop", String(Math.max(0, Math.round((parseFloat(idleRef.current) || 0) * 60))),
                     ...(iinaRef.current.trim() ? ["--iina-socket", iinaRef.current.trim()] : []),
@@ -1663,8 +2188,8 @@ except KeyboardInterrupt:
 
             // Work out the public base (public URL, else LAN IP written by the server)
             const setLinks = (b: string) => {
-                link.set(`${b}/play?key=${keyRef.current.trim()}&src={url}`)
-                watch.set(iinaRef.current.trim() ? `${b}/watch?key=${keyRef.current.trim()}` : "")
+                link.set(`${b}/play?${key ? "key=" + key + "&" : ""}src={url}`)
+                watch.set(iinaRef.current.trim() ? `${b}/watch${key ? "?key=" + key : ""}` : "")
             }
             const base = publicRef.current.trim().replace(/\/$/, "")
             if (!base) {
@@ -1691,7 +2216,7 @@ except KeyboardInterrupt:
                     tray.text("Paste this into Seanime -> Settings -> External player link:"),
                     tray.text(link.get() || "(press Start server)", { style: { wordBreak: "break-all", userSelect: "text", fontSize: "11px" } }),
                     ...(watch.get() ? [
-                        tray.text("Bridge mode: bookmark this page. It always shows what IINA is playing:"),
+                        tray.text("Bridge mode: bookmark this page. It always shows what your player is playing:"),
                         tray.text(watch.get(), { style: { wordBreak: "break-all", userSelect: "text", fontSize: "11px" } }),
                     ] : []),
                     tray.flex({ items: [
@@ -1699,37 +2224,57 @@ except KeyboardInterrupt:
                         tray.button({ label: "Stop", onClick: onStop, intent: "alert-subtle" }),
                     ] }),
                     tray.text(status.get()),
+
+                    tray.select({ label: "Playback method", fieldRef: modeRef, options: [
+                        { label: "Always transcode", value: "transcode" },
+                        { label: "Auto - direct play when the device can, otherwise transcode", value: "auto" },
+                        { label: "Direct play first (falls back to direct stream, then transcode)", value: "direct" } ] }),
+                    tray.select({ label: "In Auto, when both would work prefer", fieldRef: preferRef, options: [
+                        { label: "Direct play (lowest power use)", value: "direct" },
+                        { label: "Transcoding (most compatible, steady seeking)", value: "transcode" } ] }),
+                    tray.input({ label: "Start playback after N seconds are buffered (10 is good through a tunnel)", fieldRef: startBufRef }),
+
                     tray.input({ label: "Default subtitle: auto, a language code (eng), a track number, or blank for none. All tracks stay selectable in the player", fieldRef: subRef }),
                     tray.input({ label: "Audio track (0 = first)", fieldRef: audioRef }),
                     tray.select({ label: "Opening/ending times from the internet (AniList + AniSkip)", fieldRef: skipRef, options: [
                         { label: "On (chapters in the file are always used)", value: "on" },
                         { label: "Off (file chapters only)", value: "off" } ] }),
-                    tray.select({ label: "Heat / power", fieldRef: heatRef, options: [
-                        { label: "Cool - hardware encoder, paced (fanless Macs)", value: "cool" },
-                        { label: "Balanced - your encoder, lightly paced", value: "balanced" },
+
+                    tray.select({ label: "Heat / power (transcoding)", fieldRef: heatRef, options: [
+                        { label: "Cool - hardware encoder, paced (fanless laptops)", value: "cool" },
+                        { label: "Balanced - lightly paced", value: "balanced" },
                         { label: "Full speed - fastest, hottest", value: "full" } ] }),
-                    tray.input({ label: "Hardware encoder bitrate, Mbps at 1080p (cool mode)", fieldRef: bitrateRef }),
+                    tray.select({ label: "Encoder", fieldRef: encRef, options: [
+                        { label: "Auto - best hardware encoder found, else CPU", value: "auto" },
+                        { label: "CPU (libx264) - best quality, hottest", value: "libx264" },
+                        { label: "Apple VideoToolbox (macOS)", value: "h264_videotoolbox" },
+                        { label: "NVIDIA NVENC (Windows/Linux)", value: "h264_nvenc" },
+                        { label: "Intel Quick Sync (Windows/Linux)", value: "h264_qsv" },
+                        { label: "AMD AMF (Windows)", value: "h264_amf" },
+                        { label: "VAAPI (Linux)", value: "h264_vaapi" } ] }),
+                    tray.input({ label: "Hardware encoder bitrate, Mbps at 1080p (home network)", fieldRef: bitrateRef }),
+                    tray.input({ label: "Same, for viewers coming through your public URL (also the direct-play limit)", fieldRef: remoteBitrateRef }),
                     tray.select({ label: "Memory use (ffmpeg)", fieldRef: memRef, options: [
                         { label: "Low (about half the RAM, slightly slower)", value: "low" },
                         { label: "Balanced", value: "balanced" },
                         { label: "Full speed (most RAM)", value: "full" } ] }),
                     tray.input({ label: "Stop transcoding after N idle minutes (0 = never)", fieldRef: idleRef }),
-                    tray.input({ label: "Quality CRF (lower = better, 18)", fieldRef: crfRef }),
+                    tray.input({ label: "Quality CRF for CPU encoding (lower = better, 18)", fieldRef: crfRef }),
                     tray.select({ label: "Max height", fieldRef: heightRef, options: [
                         { label: "1080p", value: "1080" }, { label: "720p", value: "720" }, { label: "480p", value: "480" } ] }),
-                    tray.select({ label: "Encoder", fieldRef: encRef, options: [
-                        { label: "CPU (libx264) - best quality", value: "libx264" },
-                        { label: "Apple (videotoolbox) - fast", value: "h264_videotoolbox" },
-                        { label: "NVIDIA (nvenc)", value: "h264_nvenc" },
-                        { label: "Intel (qsv)", value: "h264_qsv" } ] }),
+
                     tray.input({ label: "Public URL (blank = LAN IP), e.g. https://hls.example.com", fieldRef: publicRef }),
+                    tray.input({ label: "Access key - OPTIONAL. Leave empty for a short link. Set one if your public URL is open to the internet", fieldRef: keyRef }),
                     tray.input({ label: "Port", fieldRef: portRef }),
                     tray.input({ label: "ffmpeg path", fieldRef: ffmpegRef }),
-                    tray.input({ label: "python3 path", fieldRef: pythonRef }),
+                    tray.input({ label: "Python path", fieldRef: pythonRef }),
                     tray.input({ label: "Seanime server URL (local)", fieldRef: seanimeRef }),
-                    tray.input({ label: "IINA bridge socket (blank = off, usually /tmp/iina_socket)", fieldRef: iinaRef }),
-                    tray.input({ label: "Access key (part of the link; changing it means re-pasting the link in Seanime)", fieldRef: keyRef }),
+                    tray.input({ label: "mpv/IINA bridge socket (blank = off; macOS usually /tmp/iina_socket)", fieldRef: iinaRef }),
                     ...(note.get() ? [tray.text(note.get(), { style: { fontSize: "10px", wordBreak: "break-all", userSelect: "text" } })] : []),
+
+                    tray.select({ label: "Operating system (press Start / apply settings after changing)", fieldRef: osRef, options: [
+                        { label: "macOS", value: "mac" }, { label: "Windows", value: "windows" }, { label: "Linux", value: "linux" } ] }),
+                    tray.text("Changing the system resets ffmpeg/Python to that system's usual defaults (only where you had not customised them) and picks which hardware encoders are tried.", { style: { fontSize: "10px", opacity: 0.7 } }),
                 ],
             }),
         )
