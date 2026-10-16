@@ -3,7 +3,7 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Universal Transcode v1.1 - web player for Seanime streams (Video.js 10, neutral skin).
+// Universal Transcode v1.2 - web player for Seanime streams (Video.js 10, neutral skin).
 // Direct play / direct stream / transcode (Jellyfin style), subtitle controls, skip opening/ending, cool mode.
 // Runs a small local server (Python + ffmpeg). In Seanime set  Settings -> External player link  to the
 // link shown in this tray. Playing a torrent stream then opens the web player instead of an external player.
@@ -78,7 +78,7 @@ Point it at  http(s)://<this server>/play?key=<KEY>&src={url}  and this server w
   3. redirect the browser to a Video.js (neutral skin) player page that offers every subtitle track.
 It also serves the HLS files. One transcode runs at a time; starting a new one stops the old one.
 """
-import argparse, atexit, base64, hmac, html, http.server, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, atexit, base64, hmac, html, http.server, ipaddress, math, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
@@ -120,7 +120,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -129,7 +129,8 @@ SHUTDOWN_TOKEN = secrets.token_hex(16)
 lock = threading.Lock()
 current = {"proc": None, "dir": None, "id": None, "ready": None, "state": "idle", "tracks": [], "skipped": [],
            "default": None, "probe_error": "", "src": None, "last": 0.0,
-           "skip": {"state": "pending", "segments": []}, "analysis": {}, "opts": {}, "mode": None}
+           "skip": {"state": "pending", "segments": []}, "analysis": {}, "opts": {}, "mode": None,
+           "subs": None, "prod": None, "vod": None, "restarts": 0}
 
 PLAYER_TEMPLATE = r'''<!doctype html>
 <html lang="en">
@@ -149,6 +150,7 @@ PLAYER_TEMPLATE = r'''<!doctype html>
   #ut-subs .ut-box { position: absolute; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: .12em;
                      transition: bottom .18s ease; }
   #ut-subs .ut-t { white-space: pre-wrap; }
+  #ut-subs .ut-box + .ut-box { transition: none; }
   #ut-skip { position: absolute; right: 3%; bottom: 12%; z-index: 7; pointer-events: auto; display: none; padding: .55em 1em; border-radius: 6px;
              border: 1px solid rgba(255,255,255,.55); background: rgba(0,0,0,.6); color: #fff; font: 600 15px system-ui, sans-serif; cursor: pointer;
              transition: bottom .18s ease, background .15s; }
@@ -165,7 +167,11 @@ PLAYER_TEMPLATE = r'''<!doctype html>
 </style>
 <style id="ut-ctl-style">
   /* controls injected into Video.js's Captions menu (or the fallback card) */
-  media-captions-radio-group[data-ut-hide] { display: none !important; }       /* ours replaces it: no overlap */
+  /* ours replaces Video.js's own list. Visually hidden, NOT display:none: if the element that holds keyboard focus is removed
+     from the layout the menu loses focus and closes itself (it flashed open and shut). */
+  media-captions-radio-group[data-ut-hide] { position: absolute !important; width: 1px !important; height: 1px !important; margin: 0 !important;
+     padding: 0 !important; border: 0 !important; overflow: hidden !important; clip-path: inset(50%) !important; opacity: 0 !important;
+     pointer-events: none !important; }
   .ut-ctl { box-sizing: border-box; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.3; color: inherit; text-align: left;
             max-height: 36vh; overflow-y: auto; accent-color: var(--media-accent-color, #fff); }
   .ut-ctl * { box-sizing: border-box; }
@@ -233,7 +239,8 @@ __MEDIA__
     color: '#ffffff', opacity: 100, lineHeight: 1.25, spacing: 0,
     bg: '#000000', bgOpacity: 0, pad: 0.25, radius: 0.15,
     edge: 'outline', edgeColor: '#000000', edgeWidth: 4,
-    bottom: 7, lift: 7, width: 82, align: 'center'
+    bottom: 7, lift: 7, width: 82, align: 'center',
+    topLines: true, signs: false, maxLines: 3
   };
   var PRESETS = {
     'Default':       {},
@@ -332,7 +339,7 @@ __MEDIA__
   }
 
   // ================================================================ cue store (compact arrays, selected track only)
-  var tracks = cfg.tracks.map(function (t) { return { info: t, tt: null, list: [], maxDur: 0, off: 0, busy: false, done: false }; });
+  var tracks = cfg.tracks.map(function (t) { return { info: t, tt: null, list: [], seen: {}, maxDur: 0, off: 0, busy: false, done: false }; });
   var selected = null;                                // the track object that is showing
   var didInit = false;
 
@@ -345,7 +352,7 @@ __MEDIA__
     if (Date.now() - t0 > 3000 && media.addTextTrack) { var made = media.addTextTrack('subtitles', t.info.label, t.info.lang); if (made) return made; }
     return null;
   }
-  function release(t) { t.list = []; t.maxDur = 0; t.off = 0; t.done = false; }   // free memory of tracks that are not showing
+  function release(t) { t.list = []; t.seen = {}; t.maxDur = 0; t.off = 0; t.done = false; }   // free memory of tracks that are not showing
   function readSelection() {
     var now = null;
     tracks.forEach(function (t) {
@@ -381,6 +388,9 @@ __MEDIA__
         if (j.cues && j.cues.length) {
           var needSort = false;
           j.cues.forEach(function (c) {
+            var k = c[0] + '|' + c[1] + '|' + c[2] + '|' + (c[3] || 0);
+            if (t.seen[k]) return;                       // the same line on several ASS layers
+            t.seen[k] = 1;
             if (t.list.length && c[0] < t.list[t.list.length - 1][0]) needSort = true;
             t.list.push(c);
             if (c[1] - c[0] > t.maxDur) t.maxDur = c[1] - c[0];
@@ -445,7 +455,7 @@ __MEDIA__
   }
 
   // ================================================================ overlay renderer
-  var host = null, overlay = null, box = null, toastEl = null, skipEl = null, skipSeg = null, lastSig = '', previewUntil = 0, lastActivity = Date.now();
+  var host = null, overlay = null, box = null, boxTop = null, toastEl = null, skipEl = null, skipSeg = null, lastSig = '', previewUntil = 0, lastActivity = Date.now();
   function findHost() {
     return document.querySelector('media-container') || document.querySelector('video-neutral-skin') ||
            document.querySelector('video-player') || document.body;
@@ -455,6 +465,7 @@ __MEDIA__
     if (!overlay) {
       overlay = document.createElement('div'); overlay.id = 'ut-subs';
       box = document.createElement('div'); box.className = 'ut-box'; overlay.appendChild(box);
+      boxTop = document.createElement('div'); boxTop.className = 'ut-box'; overlay.appendChild(boxTop);
       toastEl = document.createElement('div'); toastEl.id = 'ut-toast';
       skipEl = document.createElement('button'); skipEl.id = 'ut-skip'; skipEl.type = 'button';
       // clicks on our button must not reach the player (a click on the video toggles play, a double click goes fullscreen)
@@ -482,25 +493,41 @@ __MEDIA__
     }
     var t = media.currentTime || 0;
     updateSkipUi(t);
-    var act = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
-    var sample = !act.length && Date.now() < previewUntil;
+    var all = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
+    // ASS typesetting (signs, karaoke, movement) is hidden unless asked for; top-aligned dialogue goes to the top;
+    // and never more than N lines at once, newest first, so busy openings/endings cannot cover the screen.
+    var topCues = [], botCues = [];
+    all.forEach(function (c) {
+      var kind = c[3] || 0;
+      if (kind === 2 && !style.signs) return;
+      (kind === 1 && style.topLines ? topCues : botCues).push(c);
+    });
+    function cap(list) { return list.length > style.maxLines ? list.slice(list.length - style.maxLines) : list; }
+    topCues = cap(topCues); botCues = cap(botCues);
+    var sample = !topCues.length && !botCues.length && Date.now() < previewUntil;
     var h = overlay.clientHeight || 0;
     var lift = controlsVisible() ? style.lift : 0;
-    var sig = [styleVer, Math.round(h), lift, sample ? 's' : '', act.map(function (c) { return c[0] + '|' + c[1]; }).join(',')].join('#');
+    function ids(l) { return l.map(function (c) { return c[0] + '|' + c[1]; }).join(','); }
+    var sig = [styleVer, Math.round(h), lift, sample ? 's' : '', ids(botCues), ids(topCues)].join('#');
     if (sig === lastSig) return;
     lastSig = sig;
     var css = cueCss(style, h || 720);
-    box.style.bottom = (style.bottom + lift) + '%';
-    box.style.width = style.width + '%';
-    box.style.alignItems = style.align === 'left' ? 'flex-start' : style.align === 'right' ? 'flex-end' : 'center';
-    box.style.textAlign = style.align;
-    var rows = act.length ? act.map(function (c) { return fmt(c[2]); }) : (sample ? ['Sample subtitle text<br>second line'] : []);
-    box.innerHTML = rows.map(function (r) { return '<div><span class="ut-t">' + r + '</span></div>'; }).join('');
-    var spans = box.querySelectorAll('.ut-t');
-    for (var i = 0; i < spans.length; i++) {
-      for (var p in css) spans[i].style[p] = css[p];
-      spans[i].style.webkitBoxDecorationBreak = 'clone'; spans[i].style.boxDecorationBreak = 'clone';
+    function paint(el, cues, fallback) {
+      el.style.width = style.width + '%';
+      el.style.alignItems = style.align === 'left' ? 'flex-start' : style.align === 'right' ? 'flex-end' : 'center';
+      el.style.textAlign = style.align;
+      var rows = cues.length ? cues.map(function (c) { return fmt(c[2]); }) : (fallback ? [fallback] : []);
+      el.innerHTML = rows.map(function (r) { return '<div><span class="ut-t">' + r + '</span></div>'; }).join('');
+      var spans = el.querySelectorAll('.ut-t');
+      for (var i = 0; i < spans.length; i++) {
+        for (var p in css) spans[i].style[p] = css[p];
+        spans[i].style.webkitBoxDecorationBreak = 'clone'; spans[i].style.boxDecorationBreak = 'clone';
+      }
     }
+    box.style.bottom = (style.bottom + lift) + '%';
+    paint(box, botCues, sample ? 'Sample subtitle text<br>second line' : '');
+    boxTop.style.top = style.bottom + '%';
+    paint(boxTop, topCues, '');
   }
 
   // ================================================================ controls (built once, mounted in Video.js's Captions menu)
@@ -635,6 +662,10 @@ __MEDIA__
     slider(ps, 'Lift for bar', 'lift', 0, 20, 1, P);
     slider(ps, 'Max width', 'width', 30, 100, 1, P);
     seg(ps, 'Align', 'align', [['left', 'Left'], ['center', 'Centre'], ['right', 'Right']]);
+    slider(ps, 'Max lines', 'maxLines', 1, 6, 1, function (v) { return String(v); });
+    toggle(ps, 'Top lines', 'topLines');
+    toggle(ps, 'Signs/songs', 'signs');
+    ps.appendChild(el('div', 'ut-note', 'Signs/songs = typeset text from the file (karaoke, signs on screen). Off by default: it can fill the screen.'));
 
     // ---- presets
     var pr2 = section('Presets', false), prow = row('', pr2), pg2 = el('div', 'ut-seg'); prow.appendChild(pg2);
@@ -684,7 +715,13 @@ __MEDIA__
     if (!g || !g.parentNode) return false;
     ensureStyleIn(g);
     if (ctl.previousSibling !== g || ctl.parentNode !== g.parentNode) g.parentNode.insertBefore(ctl, g.nextSibling);
-    if (g.setAttribute && !g.getAttribute('data-ut-hide')) g.setAttribute('data-ut-hide', '1');
+    if (g.setAttribute && !g.getAttribute('data-ut-hide') && load('ut.nohide', '') !== '1') {
+      var hideIt = function () { g.setAttribute('data-ut-hide', '1'); };
+      var focused = false;
+      try { focused = !!(g.matches && g.matches(':focus-within')); } catch (e) {}
+      if (focused && g.addEventListener) g.addEventListener('focusout', function once() { g.removeEventListener('focusout', once); setTimeout(hideIt, 0); });
+      else hideIt();
+    }
     if (!attached) {
       attached = true; fab.style.display = 'none'; card.classList.remove('open');
       try { console.log('[universal-transcode] subtitle controls added to the Captions menu'); } catch (e) {}
@@ -792,20 +829,31 @@ __MEDIA__
       if (eng && eng.config) {
         var c = eng.config;
         c.backBufferLength = 30; c.maxBufferLength = 30; c.maxMaxBufferLength = 60; c.maxBufferSize = 48 * 1000 * 1000;
-        c.startPosition = resumeAt > 1 ? resumeAt : 0;   // the playlist grows while ffmpeg works; do not jump to the "live" end
+        if (cfg.vod) {
+          // on-demand segments can take a few seconds to appear after a seek: wait for them instead of giving up
+          var pol = c.fragLoadPolicy && c.fragLoadPolicy.default;
+          if (pol) { pol.maxTimeToFirstByteMs = 90000; pol.maxLoadTimeMs = 180000; }
+          c.fragLoadingTimeOut = 90000;
+        } else {
+          c.startPosition = resumeAt > 1 ? resumeAt : 0;   // the playlist grows while ffmpeg works; do not jump to the "live" end
+        }
         clearInterval(iv);
       } else if (++tries > 60) clearInterval(iv);
     }, 100);
   }
   function begin() {
     customElements.whenDefined('hlsjs-video').then(function () {
-      var url = 'index.m3u8';
+      // The server writes the playlist for the WHOLE episode (so the seek bar shows the real length) and starts producing
+      // segments where the viewer is: for a resume it puts the position in the playlist (#EXT-X-START) and starts there.
+      var url = 'index.m3u8' + (cfg.vod && resumeAt > 1 ? '?t=' + resumeAt.toFixed(1) : '');
       try { media.source = { src: url, type: 'application/vnd.apple.mpegurl' }; } catch (e) { media.src = url; }
       if (!media.src) media.src = url;
       tuneEngine();
-      var fixed = false;                                 // if hls.js still started near the live edge, go back once
-      media.addEventListener('loadedmetadata', function () { if (!fixed && !resumeAt && media.currentTime > 3) { fixed = true; media.currentTime = 0; } });
-      seekToResume();
+      if (!cfg.vod) {                                    // growing playlist (direct stream): hls.js would treat it as live
+        var fixed = false;
+        media.addEventListener('loadedmetadata', function () { if (!fixed && !resumeAt && media.currentTime > 3) { fixed = true; media.currentTime = 0; } });
+        seekToResume();
+      }
       startGate();
     });
   }
@@ -821,8 +869,8 @@ __MEDIA__
         if (s.stale) { show('This session ended.'); return; }
         if (s.state === 'failed' || (s.exited && s.code !== 0)) { show('ffmpeg failed (exit code ' + s.code + '). Check ffmpeg.log in the transcode temp folder.'); return; }
         show('Starting...');
-        setTimeout(waitForPlaylist, 1500);
-      }).catch(function () { setTimeout(waitForPlaylist, 1500); });
+        setTimeout(waitForPlaylist, 400);
+      }).catch(function () { setTimeout(waitForPlaylist, 400); });
     });
   }
   media.addEventListener('playing', hide);
@@ -907,8 +955,9 @@ def ffprobe_path():
 
 def probe_info(src):
     """Streams, chapters and duration of the source (one ffprobe call; only reads the start of the file)."""
-    r = subprocess.run([ffprobe_path(), "-v", "error", "-print_format", "json", "-show_streams", "-show_chapters",
-                        "-show_format", "-i", src], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROBE_TIMEOUT)
+    r = subprocess.run([ffprobe_path(), "-v", "error", "-probesize", "4M", "-analyzeduration", "3M", "-print_format", "json",
+                        "-show_streams", "-show_chapters", "-show_format", "-i", src],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROBE_TIMEOUT)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or b"ffprobe failed").decode("utf-8", "replace").strip()[-200:])
     j = json.loads(r.stdout.decode("utf-8", "replace"))
@@ -974,7 +1023,8 @@ def build_tracks(streams):
         if n > 1:
             t["label"] += " (%d)" % n
         t["id"] = "sub-%d" % t["index"]
-        t["file"] = "sub_%d.vtt" % t["index"]
+        t["fmt"] = "ass" if t["codec"] in ("ass", "ssa") else "vtt"
+        t["file"] = "sub_%d.%s" % (t["index"], t["fmt"])
     return tracks, skipped
 
 
@@ -1006,7 +1056,7 @@ def parse_ts(s):
     return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000.0
 
 
-def read_cues_from(path, off, finished, limit=262144):
+def read_vtt_from(path, off, finished, limit=262144):
     """Read the cues that start at byte offset \`off\` of a (possibly still growing) WebVTT file.
     Returns (cues, new_offset). New offsets always point at the start of an unread block, so the caller can just keep
     asking from where it stopped; nothing is kept on the server between calls."""
@@ -1042,10 +1092,155 @@ def read_cues_from(path, off, finished, limit=262144):
                     break
                 text = "\\n".join(lines[i + 1:]).strip("\\n")
                 if text:
-                    cues.append([round(start, 3), round(stop, 3), text])
+                    cues.append([round(start, 3), round(stop, 3), text, 0])
                 break
         pos = nxt
     return cues, off + pos
+
+
+# ---------------------------------------------------------------- ASS subtitles: dialogue vs typesetting
+_ASS_BLOCK = re.compile(r"\\{[^}]*\\}")
+_ASS_TYPESET = re.compile(r"\\\\(?:pos\\(|move\\(|org\\(|i?clip\\(|k\\d|kf\\d|ko\\d|frx|fry)|\\\\K\\d", re.I)
+_ASS_DRAW = re.compile(r"\\\\p[1-9]")
+_ASS_AN = re.compile(r"\\\\an(\\d)")
+_ASS_A = re.compile(r"\\\\a(\\d+)(?!n)")
+_ASS_STYLE_HINT = re.compile(r"sign|typeset|kara|\\bfx\\b", re.I)
+_ASS_EFFECT = re.compile(r"^\\s*(karaoke|scroll|banner)", re.I)
+_ass_cache = {}
+
+
+def ass_styles(path):
+    """{style name: 'top' | 'bottom'} from the file's header (cached once the [Events] section is there)."""
+    if path in _ass_cache:
+        return _ass_cache[path]
+    try:
+        with open(path, "rb") as f:
+            head = f.read(131072).decode("utf-8", "replace")
+    except OSError:
+        return {}
+    if "[Events]" not in head:
+        return {}
+    styles, section, fields = {}, "", None
+    for line in head.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section, fields = line.lower(), None
+            continue
+        if "styles]" in section:
+            if line.lower().startswith("format:"):
+                fields = [x.strip().lower() for x in line[7:].split(",")]
+            elif line.lower().startswith("style:") and fields and "alignment" in fields and "name" in fields:
+                vals = [x.strip() for x in line[6:].split(",")]
+                if len(vals) >= len(fields):
+                    try:
+                        al = int(vals[fields.index("alignment")])
+                    except ValueError:
+                        continue
+                    top = al in (7, 8, 9) if "v4+" in section else al in (5, 6, 7)
+                    styles[vals[fields.index("name")]] = "top" if top else "bottom"
+    _ass_cache[path] = styles
+    return styles
+
+
+def ass_time(t):
+    try:
+        h, m, sec = t.strip().split(":")
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+    except ValueError:
+        return None
+
+
+def _esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def ass_to_text(text):
+    """Strip ASS override tags; keep italic/bold/underline as <i><b><u>; \\\\N -> newline, \\\\h -> non-breaking space."""
+    segs, state, pos = [], [False, False, False], 0
+
+    def add(chunk):
+        if chunk:
+            segs.append((tuple(state), chunk))
+
+    for m in _ASS_BLOCK.finditer(text):
+        add(text[pos:m.start()])
+        pos = m.end()
+        for tag, val in re.findall(r"\\\\([ibu]|r)(\\d?)", m.group(0)):
+            if tag == "r":
+                state[:] = [False, False, False]
+            else:
+                state["ibu".index(tag)] = val == "1"
+    add(text[pos:])
+    out = []
+    for st, chunk in segs:
+        chunk = chunk.replace("\\\\N", "\\n").replace("\\\\n", "\\n").replace("\\\\h", "\\u00a0")
+        chunk = _esc(chunk).replace("\\u00a0", "&nbsp;")
+        for flag, tag in zip(st, "ibu"):
+            if flag and chunk.strip():
+                chunk = "<%s>%s</%s>" % (tag, chunk, tag)
+        out.append(chunk)
+    return "".join(out).strip()
+
+
+def parse_ass_dialogue(line, styles):
+    """[start, end, text, kind] or None.  kind: 0 normal, 1 top-aligned, 2 typesetting (signs, karaoke, movement...).
+    Vector drawings are dropped; they have no readable text."""
+    parts = line[9:].lstrip().split(",", 9)
+    if len(parts) < 10:
+        return None
+    start, end = ass_time(parts[1]), ass_time(parts[2])
+    if start is None or end is None or end <= start:
+        return None
+    style, effect, raw = parts[3].strip(), parts[8], parts[9]
+    blocks = "".join(_ASS_BLOCK.findall(raw))
+    if _ASS_DRAW.search(blocks):
+        return None
+    text = ass_to_text(raw)
+    if not text:
+        return None
+    typeset = bool(_ASS_TYPESET.search(blocks) or _ASS_EFFECT.search(effect) or _ASS_STYLE_HINT.search(style))
+    top = styles.get(style) == "top"
+    m = _ASS_AN.search(blocks)
+    if m:
+        top = m.group(1) in ("7", "8", "9")
+    else:
+        m = _ASS_A.search(blocks)
+        if m:
+            top = m.group(1) in ("5", "6", "7")
+    return [round(start, 3), round(end, 3), text, 2 if typeset else (1 if top else 0)]
+
+
+def read_ass_from(path, off, finished, limit=262144):
+    """Cues of a (possibly still growing) ASS file starting at byte \`off\`. Only whole lines are consumed."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            raw = f.read(limit)
+    except OSError:
+        return [], off
+    if not raw:
+        return [], off
+    at_eof = len(raw) < limit
+    nl = raw.rfind(b"\\n")
+    if nl == len(raw) - 1 or (finished and at_eof):
+        chunk = raw
+    elif nl == -1:
+        return ([], off + len(raw)) if len(raw) >= limit else ([], off)   # a line longer than the window: skip it, never stall
+    else:
+        chunk = raw[:nl + 1]
+    styles = ass_styles(path)
+    seen, cues = set(), []
+    for line in chunk.decode("utf-8", "replace").splitlines():
+        if line.startswith("Dialogue:"):
+            c = parse_ass_dialogue(line, styles)
+            if c and tuple(c) not in seen:                   # identical lines on several layers: keep one
+                seen.add(tuple(c))
+                cues.append(c)
+    return cues, off + len(chunk)
+
+
+def read_cues_from(path, off, finished, limit=262144, fmt="vtt"):
+    return (read_ass_from if fmt == "ass" else read_vtt_from)(path, off, finished, limit)
 
 
 # ---------------------------------------------------------------- opening / ending ("skip intro") data
@@ -1198,7 +1393,10 @@ def build_skip(info, src):
 # ---------------------------------------------------------------- sessions
 NEGOTIATE_TEMPLATE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Universal Transcode</title></head>
+<title>Universal Transcode</title>
+<link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/video-neutral.js">
+<link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/media/hlsjs-video.js">
+<link rel="preload" as="style" href="https://cdn.jsdelivr.net/npm/@videojs/cdn@10.0.1/global.css"></head>
 <body style="margin:0;background:#000;color:#ccc;font-family:system-ui,sans-serif">
 <p id="m" style="padding:16px">Choosing the best way to play this file...</p>
 <script id="ut-cfg" type="application/json">__CFG__</script>
@@ -1228,18 +1426,16 @@ NEGOTIATE_TEMPLATE = r'''<!doctype html>
 
 
 def stop_current():
-    p = current["proc"]
-    if p and p.poll() is None:
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            p.kill()
+    _kill(current["proc"])
+    if current["prod"]:
+        _kill(current["prod"]["proc"])
+    _kill(current["subs"])
     if current["dir"]:
         shutil.rmtree(current["dir"], ignore_errors=True)
     ev = current.get("ready")
     current.update(proc=None, dir=None, id=None, ready=None, state="idle", tracks=[], skipped=[], default=None,
-                   probe_error="", src=None, skip={"state": "pending", "segments": []}, analysis={}, opts={}, mode=None)
+                   probe_error="", src=None, skip={"state": "pending", "segments": []}, analysis={}, opts={}, mode=None,
+                   subs=None, prod=None, vod=None, restarts=0)
     if ev:
         ev.set()                       # release anyone still waiting for the old session's player page
 
@@ -1444,81 +1640,198 @@ def analyze(info, remote):
 
 
 # ---------------------------------------------------------------- ffmpeg pipelines
-def hls_output(d, burst_ok):
-    return ["-muxdelay", "0", "-muxpreload", "0",
-            "-f", "hls", "-hls_init_time", "2", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
-            "-hls_flags", "independent_segments",
-            "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "index.m3u8")]
+SEG_SECONDS = 4.0
+TS_BIAS = 10.0                   # constant added to every producer run's timestamps (see producer_command)
+AHEAD_SEGMENTS = 6               # a segment request this close to the producer's position simply waits for it
+MAX_RESTARTS = 3
 
 
 def sub_outputs(d, tracks):
-    # one extra output per subtitle track: a plain WebVTT file with the ORIGINAL cue times
-    # (rebased exactly like mpv does), flushed cue by cue so it can be read while the file is still being read.
+    """One extra ffmpeg output per subtitle track. ASS/SSA tracks are kept as ASS (their styles, alignment and effects let us
+    tell dialogue from typesetting); everything else becomes WebVTT. Both are flushed cue by cue so they can be read while
+    the file is still being read. Cue times are the ORIGINAL ones, rebased exactly like mpv does."""
     out = []
     for t in tracks:
-        out += ["-map", "0:s:%d" % t["index"], "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
-                os.path.join(d, t["file"])]
+        if t.get("fmt") == "ass":
+            out += ["-map", "0:s:%d" % t["index"], "-c:s", "copy", "-flush_packets", "1", "-f", "ass", os.path.join(d, t["file"])]
+        else:
+            out += ["-map", "0:s:%d" % t["index"], "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt", os.path.join(d, t["file"])]
     return out
 
 
-def build_command(src, d, o, tracks, mode="transcode", analysis=None):
-    """mode: transcode = re-encode picture and sound | remux = copy the picture, fix the sound (direct stream)
-             direct = nothing but the subtitle files (the browser plays the original file through /direct)"""
-    caps = ff_caps()
-    base = [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
+def base_args():
+    return [A.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+
+
+def subs_command(src, d, tracks):
+    """Subtitle extraction only (no picture, no sound): reads the file at a paced speed, tiny CPU use. Independent of the
+    video pipeline, so seeking or switching the playback method never disturbs the subtitles."""
     subs = sub_outputs(d, tracks)
-    if mode == "direct":
-        if not subs:
-            return None
-        pace = ["-readrate", "%g" % SUBS_READRATE] if caps["readrate"] else []
-        return base + pace + ["-i", src] + subs
+    if not subs:
+        return None
+    pace = ["-readrate", "%g" % SUBS_READRATE] if ff_caps()["readrate"] else []
+    return base_args() + pace + ["-i", src] + subs
+
+
+def pace_args(rate):
+    caps = ff_caps()
+    if not rate or not caps["readrate"]:
+        return []
+    out = ["-readrate", "%g" % rate]
+    if caps["burst"]:
+        out += ["-readrate_initial_burst", "30"]     # front-load 30 s so the viewer starts with a cushion
+    return out
+
+
+def remux_command(src, d, o, analysis):
+    """Direct stream: copy the picture, convert the sound only if the browser could not play it. Growing HLS playlist."""
     audio = int(o["audio"]) if o["audio"].isdigit() else 0
-    if mode == "remux":
-        analysis = analysis or {}
-        pace = ["-readrate", "3"] if caps["readrate"] else []
-        if caps["readrate"] and caps["burst"]:
-            pace += ["-readrate_initial_burst", "30"]
-        acodec = ["-c:a", "copy"] if analysis.get("audio_copy") and audio == 0 else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
-        return (base + pace + ["-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-c:v", "copy"] + acodec +
-                hls_output(d, True) + subs)
+    acodec = ["-c:a", "copy"] if (analysis or {}).get("audio_copy") and audio == 0 else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    return (base_args() + pace_args(3) + ["-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-c:v", "copy"] + acodec +
+            ["-muxdelay", "0", "-muxpreload", "0", "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
+             "-hls_playlist_type", "event", "-hls_flags", "independent_segments",
+             "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "index.m3u8")])
+
+
+def video_chain(o, pl, height, fps=None):
+    scale = "scale=-2:'min(ih,%d)'" % height
+    tail = ",format=nv12,hwupload" if pl["enc"] == "h264_vaapi" else ",format=yuv420p"
+    return (("fps=%s," % fps) if fps else "") + scale + tail
+
+
+def encode_args(o, pl, crf):
+    """Encoder + thread/lookahead limits for the chosen profile."""
+    dec, enc_threads, x264 = memory_profile(pl["mem"])
+    out = encoder_args(pl["enc"], crf, pl["kbps"])
+    if enc_threads and pl["enc"] == "libx264":
+        out += ["-threads", str(enc_threads)]
+    if x264 and pl["enc"] == "libx264":
+        out += ["-x264-params", x264]
+    return dec, out
+
+
+def input_hw_args(pl, dec):
+    out = []
+    if pl["hwdecode"]:
+        out += ["-hwaccel", pl["hwdecode"]]           # decode on the GPU/media engine (falls back to software by itself)
+    if pl["enc"] == "h264_vaapi":
+        out += ["-vaapi_device", VAAPI_DEVICE]
+    if dec and pl["enc"] == "libx264":
+        out += ["-threads", str(dec)]                 # decoder threads (input option)
+    return out
+
+
+def event_transcode_command(src, d, o):
+    """Fallback transcode (duration or frame rate unknown): a growing HLS playlist, cut on a keyframe every 2 s."""
+    audio = int(o["audio"]) if o["audio"].isdigit() else 0
     height = int(o["height"]) if o["height"].isdigit() else 1080
     crf = o["crf"] if o["crf"].isdigit() else "18"
     pl = plan(o, height)
-    dec, enc_threads, x264 = memory_profile(pl["mem"])
-    cmd = list(base)
-    if pl["readrate"]:
-        cmd += ["-readrate", "%g" % pl["readrate"]]   # read the source at N x real time: smooth, lower sustained CPU load
-        if caps["burst"]:
-            cmd += ["-readrate_initial_burst", "30"]  # ...but front-load 30 s so the viewer starts with a cushion
-    if pl["hwdecode"]:
-        cmd += ["-hwaccel", pl["hwdecode"]]           # decode on the GPU/media engine (falls back to software by itself)
-    if pl["enc"] == "h264_vaapi":
-        cmd += ["-vaapi_device", VAAPI_DEVICE]
-    if dec and pl["enc"] == "libx264":
-        cmd += ["-threads", str(dec)]                 # decoder threads (input option)
-    scale = "scale=-2:'min(ih,%d)'" % height
-    vf = scale + (",format=nv12,hwupload" if pl["enc"] == "h264_vaapi" else ",format=yuv420p")
-    cmd += ["-i", src,
-            # output 1: video + audio as HLS. -muxdelay/-muxpreload 0 stop the MPEG-TS muxer adding its default
-            # ~1.4 s offset, so HLS timestamps stay on the same timeline as the source (= mpv/IINA's time-pos).
-            "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-vf", vf]
-    cmd += encoder_args(pl["enc"], crf, pl["kbps"])
-    # HLS can only cut on keyframes and anime encodes often have one every ~10 s, which would mean 10 s segments (slow
-    # start, coarse buffering, stalls over a tunnel). A keyframe every 2 s gives clean 4 s segments after a 2 s first one.
-    cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
-    if enc_threads and pl["enc"] == "libx264":
-        cmd += ["-threads", str(enc_threads)]
-    if x264 and pl["enc"] == "libx264":
-        cmd += ["-x264-params", x264]
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"] + hls_output(d, True) + subs
+    dec, enc = encode_args(o, pl, crf)
+    return (base_args() + pace_args(pl["readrate"]) + input_hw_args(pl, dec) +
+            ["-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-vf", video_chain(o, pl, height)] + enc +
+            ["-force_key_frames", "expr:gte(t,n_forced*2)", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+             "-muxdelay", "0", "-muxpreload", "0", "-f", "hls", "-hls_init_time", "2", "-hls_time", "4", "-hls_list_size", "0",
+             "-hls_playlist_type", "event", "-hls_flags", "independent_segments",
+             "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "index.m3u8")])
+
+
+# ---------------------------------------------------------------- on-demand transcode (Jellyfin style)
+def fps_of(stream):
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        v = stream.get(key) or "0/0"
+        try:
+            n, dn = v.split("/")
+            f = float(n) / float(dn) if float(dn) else 0.0
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 5.0 <= f <= 120.0:
+            return v, f
+    return "24000/1001", 24000 / 1001.0
+
+
+def vod_plan(info):
+    """Fixed-length segments (a whole number of frames each) so the playlist for the WHOLE episode can be written up
+    front and every segment boundary lands exactly where it says, however the segments get produced."""
+    v = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"
+              and not (s.get("disposition") or {}).get("attached_pic")), None)
+    dur = float(info.get("duration") or 0)
+    if not v or dur < 5:
+        return None
+    fps_str, fps = fps_of(v)
+    k = max(24, int(round(SEG_SECONDS * fps)))
+    seg = k / fps
+    return {"fps": fps_str, "K": k, "seg": seg, "n": int(math.ceil(dur / seg - 1e-9)), "duration": dur}
+
+
+def vod_playlist(vp, start=0.0):
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % int(math.ceil(vp["seg"] + 0.01)),
+             "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    if start > 1:
+        lines.append("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES" % min(start, vp["duration"]))
+    for i in range(vp["n"]):
+        dur = vp["seg"] if i < vp["n"] - 1 else vp["duration"] - vp["seg"] * (vp["n"] - 1)
+        lines += ["#EXTINF:%.6f," % max(dur, 0.001), "seg_%05d.ts" % i]
+    lines.append("#EXT-X-ENDLIST")
+    return "\\n".join(lines) + "\\n"
+
+
+def producer_command(src, d, o, vp, start_seg, end_seg, run):
+    """Produce segments start_seg .. end_seg-1 (to the end if end_seg is None). \`-ss\` seeks the source, the output timestamps
+    are shifted back to the real position, and \`temp_file\` means a segment only appears under its final name once it is
+    complete (so "the file exists" is the same as "it can be served")."""
+    audio = int(o["audio"]) if o["audio"].isdigit() else 0
+    height = int(o["height"]) if o["height"].isdigit() else 1080
+    crf = o["crf"] if o["crf"].isdigit() else "18"
+    pl = plan(o, height)
+    dec, enc = encode_args(o, pl, crf)
+    ss = start_seg * vp["seg"]
+    cmd = base_args() + pace_args(pl["readrate"]) + input_hw_args(pl, dec)
+    if start_seg:
+        cmd += ["-ss", "%.6f" % ss]
+    cmd += ["-i", src, "-map", "0:v:0", "-map", "0:a:%d?" % audio, "-sn", "-vf", video_chain(o, pl, height, vp["fps"])] + enc
+    cmd += ["-g", str(vp["K"])]
+    if pl["enc"] == "libx264":
+        cmd += ["-keyint_min", str(vp["K"]), "-sc_threshold", "0"]
+    cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    if end_seg is not None:
+        cmd += ["-frames:v", str((end_seg - start_seg) * vp["K"]), "-t", "%.6f" % ((end_seg - start_seg) * vp["seg"])]
+    # Every run gets the same constant on top of the real position. Without it a run that starts at 0 gets shifted by the
+    # encoder's frame-reordering delay (negative first timestamps) while runs started with -ss are not, and segments from
+    # different runs would sit ~80 ms apart on the timeline. The player works out this constant from the first segment.
+    cmd += ["-output_ts_offset", "%.6f" % (ss + TS_BIAS)]
+    cmd += ["-muxdelay", "0", "-muxpreload", "0", "-f", "hls", "-hls_time", "%.3f" % (vp["seg"] - 0.05), "-hls_list_size", "0",
+            "-hls_playlist_type", "event", "-hls_flags", "independent_segments+temp_file", "-start_number", str(start_seg),
+            "-hls_segment_filename", os.path.join(d, "seg_%05d.ts"), os.path.join(d, "prod_%s.m3u8" % run)]
     return cmd
 
 
-def _clear_outputs(d):
+def seg_path(d, n):
+    return os.path.join(d, "seg_%05d.ts" % n)
+
+
+def seg_done(n):
+    return bool(current["dir"]) and os.path.exists(seg_path(current["dir"], n))
+
+
+def _kill(p):
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+
+def _spawn(cmd, d, logname="ffmpeg.log"):
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(os.path.join(d, logname), "ab"))
+
+
+def _clear_video_outputs(d):
     try:
         for f in os.listdir(d):
-            if f == "index.m3u8" or f.startswith("seg_") or f.startswith("sub_"):
+            if f == "index.m3u8" or f.startswith("seg_") or f.startswith("prod_"):
                 try:
                     os.remove(os.path.join(d, f))
                 except OSError:
@@ -1527,34 +1840,101 @@ def _clear_outputs(d):
         pass
 
 
+def _stop_video_locked():
+    _kill(current["proc"])
+    if current["prod"]:
+        _kill(current["prod"]["proc"])
+    current.update(proc=None, prod=None, restarts=0)
+    if current["dir"]:
+        _clear_video_outputs(current["dir"])
+
+
+def _start_producer_locked(sid, n):
+    """(Re)start the on-demand producer at segment n. Caller holds \`lock\`."""
+    vp = current["vod"]
+    if current["id"] != sid or not vp or n >= vp["n"]:
+        return
+    if current["prod"]:
+        _kill(current["prod"]["proc"])
+    nxt = [i for i in range(n + 1, min(vp["n"], n + 4000)) if seg_done(i)]
+    end = nxt[0] if nxt else None                      # stop where an earlier run already did the work
+    run = secrets.token_hex(3)
+    d = current["dir"]
+    try:
+        proc = _spawn(producer_command(current["src"], d, current["opts"], vp, n, end, run), d)
+    except Exception as e:
+        current["state"], current["probe_error"] = "failed", ("could not start ffmpeg: %s" % e)[:200]
+        return
+    current["prod"] = {"proc": proc, "start": n, "end": end, "next": n, "t0": time.time()}
+
+
+def ensure_producer(sid, n):
+    """Make sure a producer is (or soon will be) working on segment n; restart it where the viewer actually is."""
+    with lock:
+        if current["id"] != sid or current["mode"] != "transcode" or not current["vod"] or seg_done(n):
+            return
+        pr = current["prod"]
+        alive = bool(pr and pr["proc"].poll() is None)
+        if pr:
+            while seg_done(pr["next"]):
+                pr["next"] += 1
+        if alive and pr["start"] <= n and (pr["end"] is None or n < pr["end"]) and n <= pr["next"] + AHEAD_SEGMENTS:
+            return                                       # it is heading there: just wait
+        if pr and not alive and pr["proc"].returncode not in (0, None) and pr["next"] == pr["start"]:
+            current["restarts"] += 1                     # died without producing anything
+            if current["restarts"] == 2 and current["opts"].get("enc") != "libx264":
+                # the hardware encoder passed the start-up trial but keeps failing on this file: retry once in software
+                current["opts"]["enc"], current["opts"]["heat"] = "libx264", "balanced"
+            if current["restarts"] >= MAX_RESTARTS:
+                current["state"] = "failed"
+                return
+        _start_producer_locked(sid, n)
+
+
+def supervisor_loop():
+    """After a producer finishes a window it moves on to the next stretch that has not been produced yet."""
+    while True:
+        time.sleep(0.5)
+        try:
+            with lock:
+                pr, vp = current["prod"], current["vod"]
+                if not pr or not vp or current["mode"] != "transcode":
+                    continue
+                while seg_done(pr["next"]):
+                    pr["next"] += 1
+                if pr["proc"].poll() == 0 and pr["end"] is not None:
+                    g = pr["end"]
+                    while g < vp["n"] and seg_done(g):
+                        g += 1
+                    if g < vp["n"]:
+                        _start_producer_locked(current["id"], g)
+        except Exception as e:
+            sys.stderr.write("supervisor: %s\\n" % e)
+
+
 def _start_mode_locked(sid, mode):
-    """(Re)start the pipeline for the running session. The caller holds \`lock\`."""
+    """(Re)start the video pipeline of the running session. The caller holds \`lock\`."""
     if current["id"] != sid:
         return None
     if A.play_mode == "transcode":
         mode = "transcode"
     if current["mode"] == mode and current["state"] in ("running", "direct"):
         return mode
-    p = current["proc"]
-    if p and p.poll() is None:
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            p.kill()
-    d = current["dir"]
-    _clear_outputs(d)
+    _stop_video_locked()
+    d, state = current["dir"], "running"
     try:
-        cmd = build_command(current["src"], d, current["opts"], current["tracks"], mode, current["analysis"])
-        if cmd is None:
-            proc, state = None, "direct"
+        if mode == "direct":
+            state = "direct"
+        elif mode == "remux":
+            current["proc"] = _spawn(remux_command(current["src"], d, current["opts"], current["analysis"]), d)
+        elif current["vod"]:
+            _start_producer_locked(sid, 0)
         else:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(os.path.join(d, "ffmpeg.log"), "ab"))
-            state = "running"
+            current["proc"] = _spawn(event_transcode_command(current["src"], d, current["opts"]), d)
     except Exception as e:
-        proc, state = None, "failed"
+        state = "failed"
         current["probe_error"] = ("could not start ffmpeg: %s" % e)[:200]
-    current.update(proc=proc, mode=mode, state=state, last=time.time())
+    current.update(mode=mode, state=state, last=time.time())
     return mode
 
 
@@ -1563,8 +1943,16 @@ def start_mode(sid, mode):
         return _start_mode_locked(sid, mode)
 
 
+def main_proc():
+    """The process whose exit means 'the video pipeline stopped'."""
+    if current["proc"]:
+        return current["proc"]
+    return (current["prod"] or {}).get("proc")
+
+
 def launch(sid, d, src, o, ready):
-    """Background worker: probe the file (subtitle tracks, chapters, codecs), then start what the chosen mode needs."""
+    """Background worker: probe the file (subtitle tracks, chapters, codecs), start subtitle extraction and the pipeline
+    that will most likely be needed, then resolve opening/ending times."""
     probe_error, info = "", {"streams": [], "chapters": [], "duration": 0.0}
     try:
         info = probe_info(src)
@@ -1573,13 +1961,27 @@ def launch(sid, d, src, o, ready):
     tracks, skipped = build_tracks(info["streams"])
     default = pick_default(tracks, o["sub"])
     analysis = analyze(info, o.get("remote"))
+    vp = vod_plan(info)
     with lock:
         if current["id"] != sid:        # a newer session replaced this one while we were probing
             return
         current.update(tracks=tracks, skipped=skipped, default=default, probe_error=probe_error, src=src, last=time.time(),
-                       analysis=analysis, opts=o, mode=None, state="ready")
-        if A.play_mode == "transcode":
-            _start_mode_locked(sid, "transcode")     # nothing to decide: start right away
+                       analysis=analysis, opts=o, mode=None, state="ready", vod=vp)
+        cmd = subs_command(src, d, tracks)
+        if cmd:
+            try:
+                current["subs"] = _spawn(cmd, d, "subs.log")
+            except Exception as e:
+                current["probe_error"] = ("could not start subtitle extraction: %s" % e)[:200]
+        # start what will most likely be needed now, so the page does not have to wait for a round trip. The browser can
+        # still ask for something else (it knows what it can play).
+        if A.play_mode == "transcode" or not analysis.get("remux_ok"):
+            guess = "transcode"
+        elif analysis.get("direct_ok"):
+            guess = "direct"
+        else:
+            guess = "remux"
+        _start_mode_locked(sid, guess)
     try:
         with open(os.path.join(d, "tracks.json"), "w") as f:
             json.dump({"tracks": tracks, "skipped": skipped, "default": default}, f)
@@ -1611,7 +2013,8 @@ def render_player(kind="hls", via=""):
     cfg = {"tracks": current["tracks"], "skipped": current["skipped"], "default": current["default"],
            "probe_error": current["probe_error"], "bridge": bool(A.iina_socket), "kind": kind, "via": via,
            "analysis": current["analysis"], "mode": A.play_mode, "prefer": A.prefer, "startBuffer": A.start_buffer,
-           "keyRequired": bool(A.key)}
+           "keyRequired": bool(A.key), "vod": bool(via == "transcode" and current["vod"]),
+           "duration": (current["vod"] or {}).get("duration", 0)}
     tags = "\\n".join('      <track id="%s" kind="subtitles" label="%s" srclang="%s">' % (
         html.escape(t["id"], True), html.escape(t["label"], True), html.escape(t["lang"], True))
         for t in current["tracks"])
@@ -1885,7 +2288,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             return self.play()
         if path == "/status":
             # deliberately minimal: no session id and no log (the log can contain the stream token)
-            p = current["proc"]
+            p = main_proc()
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             mine = q.get("sid", [""])[0]
             if mine and mine == current["id"]:
@@ -1931,7 +2334,11 @@ class H(http.server.SimpleHTTPRequestHandler):
             return
         if path == "/":
             return self.reply(200, "Universal Transcode %s is running. Use /play?src=STREAM_URL (add &key=KEY if you set an access key)" % VERSION)
-        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues|skip|start|direct)", path)
+        m = re.fullmatch(r"/([0-9a-f]{16})/(player\\.html|cues|skip|start|direct|index\\.m3u8|seg_(\\d{5})\\.ts)", path)
+        if m and (m.group(2) == "index.m3u8" or m.group(3) is not None):
+            if current["id"] == m.group(1) and current["mode"] == "transcode" and current["vod"]:
+                return self.serve_vod_index(m.group(1)) if m.group(3) is None else self.serve_vod_segment(m.group(1), int(m.group(3)))
+            m = None                                                   # growing playlists/segments are plain files
         if m:
             if m.group(2) == "direct":
                 return self.serve_direct(m.group(1))
@@ -1960,8 +2367,8 @@ class H(http.server.SimpleHTTPRequestHandler):
         q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
         kind, via = q.get("m", [""])[0], q.get("via", [""])[0]
         if kind not in ("hls", "direct"):
-            if A.play_mode == "transcode":
-                kind, via = "hls", "transcode"
+            if A.play_mode == "transcode" or not current["analysis"].get("direct_ok"):
+                kind, via = "hls", current["mode"] or "transcode"          # nothing to negotiate: the pipeline is already running
             else:
                 return self.reply(200, render_negotiation(), "text/html")   # let the browser pick direct / remux / transcode
         # make sure the pipeline this page needs is actually running (bookmark, reload, hand-edited URL)
@@ -1970,6 +2377,51 @@ class H(http.server.SimpleHTTPRequestHandler):
         elif kind == "direct" and current["mode"] != "direct":
             start_mode(sid, "direct")
         return self.reply(200, render_player(kind, via or current["mode"] or ""), "text/html")
+
+    def serve_vod_index(self, sid):
+        """The playlist for the WHOLE episode, so the player shows the real length and can seek anywhere."""
+        vp = current["vod"]
+        q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        try:
+            start = max(0.0, float(q.get("t", ["0"])[0]))
+        except ValueError:
+            start = 0.0
+        current["last"] = time.time()
+        if start > 1:
+            ensure_producer(sid, min(vp["n"] - 1, int(start // vp["seg"])))      # begin where the viewer will be
+        return self.reply(200, vod_playlist(vp, start), "application/vnd.apple.mpegurl")
+
+    def serve_vod_segment(self, sid, n):
+        """Hand out segment n, producing it first if needed (restarting ffmpeg at n when the viewer jumped there)."""
+        vp = current["vod"]
+        if n >= vp["n"]:
+            return self.reply(404, "no such segment")
+        deadline = time.time() + 75
+        while True:
+            if current["id"] != sid or current["mode"] != "transcode":
+                return self.reply(404, "session changed")
+            current["last"] = time.time()
+            if seg_done(n):
+                break
+            if current["state"] == "failed":
+                return self.reply(500, "ffmpeg failed (see ffmpeg.log)")
+            if time.time() > deadline:
+                return self.reply(504, "segment not ready")
+            ensure_producer(sid, n)
+            time.sleep(0.1)
+        try:
+            with open(seg_path(current["dir"], n), "rb") as f:
+                body = f.read()
+        except OSError:
+            return self.reply(404, "segment vanished")
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def serve_start(self, sid):
         """The page tells us which pipeline it needs: direct (subtitles only), remux (copy picture) or transcode."""
@@ -2034,10 +2486,10 @@ class H(http.server.SimpleHTTPRequestHandler):
         track = next((t for t in current["tracks"] if t["index"] == idx), None) if current["id"] == sid else None
         if not track:
             return self.reply(404, "no such track")
-        p = current["proc"]
+        p = current["subs"]
         live = bool(p and p.poll() is None)
         path = os.path.join(current["dir"], track["file"])
-        cues, new_off = read_cues_from(path, start, not live)
+        cues, new_off = read_cues_from(path, start, not live, fmt=track.get("fmt", "vtt"))
         try:
             eof = new_off >= os.path.getsize(path)
         except OSError:
@@ -2106,6 +2558,7 @@ except Exception:
 if A.iina_socket:
     threading.Thread(target=bridge_loop, daemon=True).start()
 threading.Thread(target=idle_loop, daemon=True).start()
+threading.Thread(target=supervisor_loop, daemon=True).start()
 
 httpd = None
 for _ in range(10):
