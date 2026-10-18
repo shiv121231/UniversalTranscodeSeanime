@@ -120,7 +120,7 @@ A = ap.parse_args()
 
 os.makedirs(A.root, exist_ok=True)
 os.chdir(A.root)
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 LOCAL = A.seanime.rstrip("/")
 # Shutdown token lives next to (not inside) the served folder, so a newer instance can replace this one
 # even if the access key changed. Anything on the web can't read it.
@@ -240,7 +240,7 @@ __MEDIA__
     bg: '#000000', bgOpacity: 0, pad: 0.25, radius: 0.15,
     edge: 'outline', edgeColor: '#000000', edgeWidth: 4,
     bottom: 7, lift: 7, width: 82, align: 'center',
-    topLines: true, signs: false, maxLines: 3
+    topLines: true, showSigns: true, showFx: false, maxLines: 3
   };
   var PRESETS = {
     'Default':       {},
@@ -494,12 +494,13 @@ __MEDIA__
     var t = media.currentTime || 0;
     updateSkipUi(t);
     var all = (selected && selected.list.length) ? activeAt(selected.list, t, delay, selected.maxDur) : [];
-    // ASS typesetting (signs, karaoke, movement) is hidden unless asked for; top-aligned dialogue goes to the top;
+    // ASS effect fragments are hidden unless asked for; top-aligned dialogue goes to the top;
     // and never more than N lines at once, newest first, so busy openings/endings cannot cover the screen.
     var topCues = [], botCues = [];
     all.forEach(function (c) {
       var kind = c[3] || 0;
-      if (kind === 2 && !style.signs) return;
+      if (kind === 2 && !style.showFx) return;          // generated karaoke fragments, clip/move effects: never readable
+      if (kind === 3 && !style.showSigns) return;       // positioned text on screen (signs, scrolling credits)
       (kind === 1 && style.topLines ? topCues : botCues).push(c);
     });
     function cap(list) { return list.length > style.maxLines ? list.slice(list.length - style.maxLines) : list; }
@@ -664,8 +665,9 @@ __MEDIA__
     seg(ps, 'Align', 'align', [['left', 'Left'], ['center', 'Centre'], ['right', 'Right']]);
     slider(ps, 'Max lines', 'maxLines', 1, 6, 1, function (v) { return String(v); });
     toggle(ps, 'Top lines', 'topLines');
-    toggle(ps, 'Signs/songs', 'signs');
-    ps.appendChild(el('div', 'ut-note', 'Signs/songs = typeset text from the file (karaoke, signs on screen). Off by default: it can fill the screen.'));
+    toggle(ps, 'Signs', 'showSigns');
+    toggle(ps, 'Effects', 'showFx');
+    ps.appendChild(el('div', 'ut-note', 'Signs = positioned text (signs, scrolling credits); on by default. Effects = karaoke/animation fragments from the file; off by default because they can fill the screen.'));
 
     // ---- presets
     var pr2 = section('Presets', false), prow = row('', pr2), pg2 = el('div', 'ut-seg'); prow.appendChild(pg2);
@@ -1100,12 +1102,16 @@ def read_vtt_from(path, off, finished, limit=262144):
 
 # ---------------------------------------------------------------- ASS subtitles: dialogue vs typesetting
 _ASS_BLOCK = re.compile(r"\\{[^}]*\\}")
-_ASS_TYPESET = re.compile(r"\\\\(?:pos\\(|move\\(|org\\(|i?clip\\(|k\\d|kf\\d|ko\\d|frx|fry)|\\\\K\\d", re.I)
+_ASS_FX = re.compile(r"\\\\(?:i?clip\\(|move\\(|org\\(|frx|fry)", re.I)       # reveal / movement / 3D effects: never readable captions
+_ASS_T = re.compile(r"\\\\t\\(", re.I)                                          # animated transform
+_ASS_POS = re.compile(r"\\\\pos\\(", re.I)
 _ASS_DRAW = re.compile(r"\\\\p[1-9]")
 _ASS_AN = re.compile(r"\\\\an(\\d)")
 _ASS_A = re.compile(r"\\\\a(\\d+)(?!n)")
-_ASS_STYLE_HINT = re.compile(r"sign|typeset|kara|\\bfx\\b", re.I)
-_ASS_EFFECT = re.compile(r"^\\s*(karaoke|scroll|banner)", re.I)
+_ASS_SIGN_STYLE = re.compile(r"sign|typeset", re.I)
+_ASS_FX_STYLE = re.compile(r"(^|[^a-z])fx([^a-z]|$)", re.I)
+_ASS_FX_EFFECT = ("fx", "template", "code")                                    # Aegisub's generated karaoke fragments
+_ASS_SCROLL = re.compile(r"^\\s*(scroll|banner)", re.I)
 _ass_cache = {}
 
 
@@ -1183,22 +1189,26 @@ def ass_to_text(text):
 
 
 def parse_ass_dialogue(line, styles):
-    """[start, end, text, kind] or None.  kind: 0 normal, 1 top-aligned, 2 typesetting (signs, karaoke, movement...).
-    Vector drawings are dropped; they have no readable text."""
+    """[start, end, text, kind] or None.
+    kind: 0 normal | 1 top-aligned | 2 effects (generated karaoke fragments, clip/move/rotate effects: never readable) |
+          3 signs (positioned text, scrolling credits, sign styles).
+    Karaoke lyric lines (\\\\k tags) are ordinary readable lines and stay kind 0/1. Vector drawings are dropped."""
     parts = line[9:].lstrip().split(",", 9)
     if len(parts) < 10:
         return None
     start, end = ass_time(parts[1]), ass_time(parts[2])
     if start is None or end is None or end <= start:
         return None
-    style, effect, raw = parts[3].strip(), parts[8], parts[9]
+    style, effect, raw = parts[3].strip(), parts[8].strip().lower(), parts[9]
     blocks = "".join(_ASS_BLOCK.findall(raw))
     if _ASS_DRAW.search(blocks):
         return None
     text = ass_to_text(raw)
     if not text:
         return None
-    typeset = bool(_ASS_TYPESET.search(blocks) or _ASS_EFFECT.search(effect) or _ASS_STYLE_HINT.search(style))
+    has_pos = bool(_ASS_POS.search(blocks))
+    fx = bool(_ASS_FX.search(blocks) or (_ASS_T.search(blocks) and has_pos) or effect in _ASS_FX_EFFECT or _ASS_FX_STYLE.search(style))
+    sign = bool(has_pos or _ASS_SCROLL.search(effect) or _ASS_SIGN_STYLE.search(style))
     top = styles.get(style) == "top"
     m = _ASS_AN.search(blocks)
     if m:
@@ -1207,7 +1217,7 @@ def parse_ass_dialogue(line, styles):
         m = _ASS_A.search(blocks)
         if m:
             top = m.group(1) in ("5", "6", "7")
-    return [round(start, 3), round(end, 3), text, 2 if typeset else (1 if top else 0)]
+    return [round(start, 3), round(end, 3), text, 2 if fx else (3 if sign else (1 if top else 0))]
 
 
 def read_ass_from(path, off, finished, limit=262144):
